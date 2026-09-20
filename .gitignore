@@ -1,0 +1,27 @@
+# Rendered reports and R Markdown intermediates
+*.html
+*_files/
+*.knit.md
+*.utf8.md
+
+# Analysis caches and generated results
+cache/
+results/
+final_day_projection/
+metagenome_overlap_validation_pca/
+paired_scatter_pdfs_*/
+*.rds
+*.RData
+*.Rhistory
+
+# Generated tables and figures
+*.csv
+*.tsv
+*.pdf
+*.png
+*.svg
+
+# Editor and operating-system files
+.Rproj.user/
+*.Rproj
+.DS_Store

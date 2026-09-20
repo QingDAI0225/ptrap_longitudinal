@@ -1,0 +1,374 @@
+---
+title: "final_day_recovery_analysis"
+output: html_document
+---
+
+```{r setup, message=FALSE, warning=FALSE}
+rm(list = ls())
+
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(stringr)
+  library(ggplot2)
+  library(readr)
+  library(tibble)
+})
+
+theme_set(theme_bw())
+options(stringsAsFactors = FALSE)
+
+ptrap_cols <- c(
+  "handwashing p-trap 1" = "#1b9e77",
+  "handwashing p-trap 2" = "#d95f02",
+  "tap water p-trap" = "#7570b3"
+)
+
+ptrap_display_levels <- c(
+  "handwashing p-trap 1",
+  "handwashing p-trap 2",
+  "tap water p-trap"
+)
+
+theme_ptrap_like <- function(base_size = 12) {
+  theme_bw(base_size = base_size) +
+    theme(
+      panel.grid.minor = element_blank(),
+      strip.background = element_rect(fill = "grey95", color = "grey70")
+    )
+}
+
+timepoint_cols <- c(
+  "0h" = "#1b9e77",
+  "2h" = "#d95f02",
+  "6h" = "#7570b3",
+  "12h" = "#e7298a",
+  "late centroid" = "#d95f02"
+)
+```
+
+# Paths
+
+```{r}
+code_dir <- normalizePath(getwd(), mustWork = TRUE)
+workspace_dir <- normalizePath(file.path(code_dir, ".."), mustWork = TRUE)
+cache_dir <- path.expand(Sys.getenv(
+  "PTRAP_CACHE_DIR",
+  unset = file.path(workspace_dir, "cache")
+))
+output_root <- path.expand(Sys.getenv("PTRAP_OUTPUT_DIR", unset = code_dir))
+part1_file <- file.path(cache_dir, "part1_pre_prediction_cache.rds")
+out_dir <- file.path(output_root, "final_day_projection")
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+
+stopifnot(file.exists(part1_file))
+obj <- readRDS(part1_file)
+required <- c("metadata", "vsearch_clr_global_clean", "pca_25_ptrap", "scores_25_ptrap")
+missing_req <- setdiff(required, names(obj))
+if (length(missing_req) > 0) {
+  stop("Missing required objects in part1 cache: ", paste(missing_req, collapse = ", "))
+}
+metadata <- obj$metadata
+vsearch_clr_global_clean <- obj$vsearch_clr_global_clean
+pca_25_ptrap <- obj$pca_25_ptrap
+scores_25_ptrap <- obj$scores_25_ptrap
+```
+
+# Helpers
+
+```{r}
+annotate_final_day_samples <- function(meta_tbl) {
+  meta_tbl %>%
+    mutate(
+      is_aug9 = date == as.Date("2024-08-09"),
+      has_ampm = str_detect(Sample.Name, regex("am|pm", ignore_case = TRUE)),
+      timepoint = case_when(
+        is_aug9 & !has_ampm & Phenotype == "PTW" ~ "pre_flush",
+        is_aug9 & str_detect(Sample.Name, "_11am\\d?_20240809$") ~ "0h",
+        is_aug9 & str_detect(Sample.Name, "_11pm\\d?_20240809$") ~ "12h",
+        is_aug9 & str_detect(Sample.Name, "_1pm\\d?_20240809$")  ~ "2h",
+        is_aug9 & str_detect(Sample.Name, "_5pm\\d?_20240809$")  ~ "6h",
+        TRUE ~ NA_character_
+      ),
+      time_hours = case_when(
+        timepoint == "pre_flush" ~ -0.1,
+        timepoint == "0h" ~ 0,
+        timepoint == "2h" ~ 2,
+        timepoint == "6h" ~ 6,
+        timepoint == "12h" ~ 12,
+        TRUE ~ NA_real_
+      ),
+      ptrap_final = case_when(
+        !is.na(ptrap) ~ as.numeric(ptrap),
+        str_detect(Sample.Name, "_11am1_|_1pm1_|_5pm1_|_11pm1_") ~ 1,
+        str_detect(Sample.Name, "_11am2_|_1pm2_|_5pm2_|_11pm2_") ~ 2,
+        str_detect(Sample.Name, "_11am3_|_1pm3_|_5pm3_|_11pm3_") ~ 3,
+        TRUE ~ NA_real_
+      )
+    ) %>%
+    mutate(
+      ptrap_final = factor(
+        ptrap_final,
+        levels = c(1, 3, 2),
+        labels = ptrap_display_levels
+      ),
+      timepoint = factor(timepoint, levels = c("pre_flush", "0h", "2h", "6h", "12h"))
+    )
+}
+
+get_prcomp_obj <- function(pca_fit) {
+  if (inherits(pca_fit, "prcomp")) return(pca_fit)
+  if (is.list(pca_fit) && !is.null(pca_fit$pca) && inherits(pca_fit$pca, "prcomp")) return(pca_fit$pca)
+  stop("PCA object is neither a prcomp object nor a list containing $pca")
+}
+
+build_sample_feature_matrix <- function(clr_tbl, sample_names, feature_ids = NULL) {
+  clr_df <- as.data.frame(clr_tbl)
+
+  # use id column as feature names when available
+  if ("id" %in% colnames(clr_df)) {
+    rownames(clr_df) <- make.unique(as.character(clr_df$id))
+  }
+
+  keep_samples <- intersect(sample_names, colnames(clr_df))
+  if (length(keep_samples) == 0) {
+    stop(
+      "No requested sample names found in CLR table columns.\n",
+      "First few requested sample names: ", paste(head(sample_names, 10), collapse = ", "), "\n",
+      "First few CLR columns: ", paste(head(colnames(clr_df), 20), collapse = ", ")
+    )
+  }
+
+  if (!is.null(feature_ids)) {
+    keep_features <- intersect(feature_ids, rownames(clr_df))
+    if (length(keep_features) == 0) {
+      stop(
+        "No PCA feature IDs found in CLR table rownames.\n",
+        "First few PCA feature_ids: ", paste(head(feature_ids, 10), collapse = ", "), "\n",
+        "First few CLR rownames: ", paste(head(rownames(clr_df), 10), collapse = ", ")
+      )
+    }
+    mat <- as.matrix(clr_df[keep_features, keep_samples, drop = FALSE])
+    mat <- t(mat)
+    mat <- mat[, feature_ids[feature_ids %in% colnames(mat)], drop = FALSE]
+  } else {
+    mat <- as.matrix(clr_df[, keep_samples, drop = FALSE])
+    mat <- t(mat)
+  }
+
+  storage.mode(mat) <- "numeric"
+  mat
+}
+
+project_into_existing_pca <- function(prcomp_obj, projection_tbl, sample_names) {
+  feature_ids <- rownames(prcomp_obj$rotation)
+  x_new <- build_sample_feature_matrix(
+    clr_tbl = projection_tbl,
+    sample_names = sample_names,
+    feature_ids = feature_ids
+  )
+
+  proj <- predict(prcomp_obj, newdata = x_new)
+  proj <- as.data.frame(proj)
+  if (!all(c("PC1", "PC2") %in% names(proj))) names(proj)[1:2] <- c("PC1", "PC2")
+  proj$Sample.Name <- rownames(proj)
+  as_tibble(proj)
+}
+
+compute_late_centroid <- function(scores_df, date_cutoff = as.Date("2024-08-09"), n_recent = 3) {
+  scores_df %>%
+    mutate(ptrap_chr = as.character(ptrap)) %>%
+    filter(!is.na(ptrap_chr), !is.na(date), date < date_cutoff) %>%
+    group_by(ptrap_chr) %>%
+    arrange(desc(date), .by_group = TRUE) %>%
+    slice_head(n = n_recent) %>%
+    summarise(
+      late_PC1 = mean(PC1, na.rm = TRUE),
+      late_PC2 = mean(PC2, na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    mutate(
+      ptrap_final = recode(ptrap_chr, `1` = "handwashing p-trap 1", `2` = "tap water p-trap", `3` = "handwashing p-trap 2"),
+      ptrap_final = factor(ptrap_final, levels = ptrap_display_levels)
+    )
+}
+```
+
+# prepare metadata and samples
+
+```{r}
+metadata2 <- annotate_final_day_samples(metadata)
+
+# pre-flush samples already inside original PCA
+existing_scores2 <- scores_25_ptrap %>%
+  mutate(PCR.cycles = 25) %>%
+  left_join(
+    metadata2 %>% select(Sample.Name, ptrap_final, timepoint, time_hours),
+    by = "Sample.Name"
+  )
+
+pre_ref <- existing_scores2 %>%
+  filter(timepoint == "pre_flush", !is.na(ptrap_final)) %>%
+  select(Sample.Name, PC1, PC2, ptrap_final, timepoint, time_hours)
+
+# timed samples to project (only those actually present in decontam-cleaned global CLR)
+all_timed_names <- metadata2 %>%
+  filter(
+    PCR.cycles == 25,
+    Phenotype == "PTW",
+    date == as.Date("2024-08-09"),
+    timepoint %in% c("0h", "2h", "6h", "12h"),
+    !is.na(ptrap_final)
+  ) %>%
+  pull(Sample.Name) %>%
+  unique()
+
+available_timed_names <- intersect(all_timed_names, colnames(vsearch_clr_global_clean))
+missing_timed_names <- setdiff(all_timed_names, available_timed_names)
+
+message("Available timed samples in vsearch_clr_global_clean: ", length(available_timed_names))
+if (length(missing_timed_names) > 0) {
+  message("Missing timed samples: ", paste(missing_timed_names, collapse = ", "))
+}
+```
+
+# projection
+
+```{r}
+pca_obj <- get_prcomp_obj(pca_25_ptrap)
+
+projected <- project_into_existing_pca(
+  prcomp_obj = pca_obj,
+  projection_tbl = vsearch_clr_global_clean,
+  sample_names = available_timed_names
+) %>%
+  left_join(
+    metadata2 %>% select(Sample.Name, ptrap_final, timepoint, time_hours, PCR.cycles),
+    by = "Sample.Name"
+  ) %>%
+  arrange(ptrap_final, time_hours)
+
+late_centroid <- compute_late_centroid(scores_25_ptrap)
+
+projected_with_dist <- projected %>%
+  left_join(
+    pre_ref %>% select(ptrap_final, pre_PC1 = PC1, pre_PC2 = PC2),
+    by = "ptrap_final"
+  ) %>%
+  left_join(
+    late_centroid %>% select(ptrap_final, late_PC1, late_PC2),
+    by = "ptrap_final"
+  ) %>%
+  mutate(
+    distance_to_preflush = sqrt((PC1 - pre_PC1)^2 + (PC2 - pre_PC2)^2),
+    distance_to_late_centroid = sqrt((PC1 - late_PC1)^2 + (PC2 - late_PC2)^2)
+  )
+```
+
+# plots
+
+```{r}
+p_time <- ggplot() +
+  geom_point(
+    data = existing_scores2 %>% filter(!is.na(ptrap)),
+    aes(PC1, PC2), color = "grey80", size = 1.2, alpha = 0.7
+  ) +
+  geom_point(
+    data = pre_ref,
+    aes(PC1, PC2), color = "black", size = 2.8
+  ) +
+  geom_text(
+    data = pre_ref,
+    aes(PC1, PC2, label = "pre"), nudge_y = 2, size = 3
+  ) +
+  geom_path(
+    data = projected,
+    aes(PC1, PC2, group = ptrap_final), color = "#1f78b4", linewidth = 0.7
+  ) +
+  geom_point(
+    data = late_centroid,
+    aes(late_PC1, late_PC2, shape = "late centroid"),
+    stroke = 1.1, size = 3.4, color = "#d95f02"
+  ) +
+  geom_point(
+    data = projected,
+    aes(PC1, PC2, color = timepoint), size = 2.4
+  ) +
+  facet_wrap(~ ptrap_final, scales = "fixed") +
+  scale_color_manual(
+    values = timepoint_cols,
+    breaks = c("0h", "2h", "6h", "12h")
+  ) +
+  scale_shape_manual(values = c("late centroid" = 4), name = NULL) +
+  guides(
+    color = guide_legend(order = 1),
+    shape = guide_legend(order = 2, override.aes = list(color = "#d95f02"))
+  ) +
+  labs(
+    x = "PC1", y = "PC2", color = "timepoint"
+  )
+
+p_dist <- projected_with_dist %>%
+  mutate(ptrap_final = factor(ptrap_final, levels = ptrap_display_levels)) %>%
+  ggplot(aes(time_hours, distance_to_late_centroid, color = ptrap_final, group = ptrap_final)) +
+  geom_line(linewidth = 0.9, lineend = "round") +
+  geom_point(shape = 21, fill = "white", stroke = 0.5, size = 2.8) +
+  geom_text(
+    aes(label = paste0(time_hours, "h")),
+    vjust = -0.9, size = 3, show.legend = FALSE
+  ) +
+  scale_color_manual(values = ptrap_cols, name = "group") +
+  scale_x_continuous(breaks = c(0, 2, 6, 12), minor_breaks = NULL) +
+  labs(
+    x = "Hours post-flush",
+    y = "Distance to late-stage centroid"
+  ) +
+  theme_ptrap_like()
+
+```
+
+```{r fig.width=11, fig.height=4}
+print(p_time)
+```
+
+```{r fig.width=8, fig.height=5}
+print(p_dist)
+```
+
+# Save tables
+
+```{r}
+write_csv(
+  metadata2 %>%
+    filter(PCR.cycles == 25, Phenotype == "PTW", date == as.Date("2024-08-09")) %>%
+    select(Sample.Name, ptrap_final, timepoint, time_hours, PCR.cycles),
+  file.path(out_dir, "final_day_time_annotations.csv")
+)
+
+write_csv(projected, file.path(out_dir, "final_day_projected_scores.csv"))
+write_csv(projected_with_dist, file.path(out_dir, "final_day_projected_summary.csv"))
+write_csv(pre_ref, file.path(out_dir, "final_day_preflush_reference_points.csv"))
+write_csv(late_centroid, file.path(out_dir, "final_day_late_centroids.csv"))
+
+pdf(file.path(out_dir, "final_day_projected_pca_trajectory.pdf"), width = 10, height = 6)
+print(p_time)
+dev.off()
+
+pdf(file.path(out_dir, "final_day_projected_distance_recovery.pdf"), width = 9, height = 5)
+print(p_dist)
+dev.off()
+
+saveRDS(
+  list(
+    projected = projected,
+    projected_with_dist = projected_with_dist,
+    pre_ref = pre_ref,
+    late_centroid = late_centroid,
+    available_timed_names = available_timed_names,
+    missing_timed_names = missing_timed_names
+  ),
+  file.path(out_dir, "final_day_projected_objects.rds")
+)
+
+message("Done. Outputs written to: ", out_dir)
+
+```

@@ -1,0 +1,2176 @@
+---
+title: "02-Source_support_compute"
+output: html_document
+---
+
+```{r}
+suppressPackageStartupMessages({
+  library(ggplot2)
+  library(tidyr)
+  library(dplyr)
+  library(stringr)
+  library(purrr)
+  library(tibble)
+})
+
+theme_set(theme_bw())
+options(stringsAsFactors = FALSE)
+```
+
+```{r}
+code_dir <- normalizePath(getwd(), mustWork = TRUE)
+workspace_dir <- normalizePath(file.path(code_dir, ".."), mustWork = TRUE)
+cache_dir <- path.expand(Sys.getenv(
+  "PTRAP_CACHE_DIR",
+  unset = file.path(workspace_dir, "cache")
+))
+part1_cache_file <- file.path(cache_dir, "part1_pre_prediction_cache.rds")
+part2_results_file <- file.path(cache_dir, "part2_source_support_results.rds")
+
+stopifnot(file.exists(part1_cache_file))
+
+part1_cache_objects <- readRDS(part1_cache_file)
+part1_required_names <- c(
+  "id_cols", "metadata", "sample_qc_35", "count_35_decontam",
+  "vsearch_ra_691_clean_with_blanks", "vsearch_ra_692_clean_with_blanks"
+)
+missing_part1 <- setdiff(part1_required_names, names(part1_cache_objects))
+if (length(missing_part1) > 0) {
+  stop("Part 1 cache is missing: ", paste(missing_part1, collapse = ", "))
+}
+list2env(part1_cache_objects[part1_required_names], envir = environment())
+
+message("Loaded part 1 cache from: ", part1_cache_file)
+```
+
+# CLR source-support helper functions 
+```{r}
+extract_date_from_name_int <- function(x) {
+  m <- stringr::str_extract(x, "\\d{8}")
+  as.Date(m, format = "%Y%m%d")
+}
+
+extract_ptrap_from_name_int <- function(x) {
+  out <- stringr::str_match(x, "PTW_[A-Za-z]+([123])_")[, 2]
+  suppressWarnings(as.integer(out))
+}
+
+ra_tbl_to_mat_int <- function(ra_tbl, id_cols = c("Sequence", "Taxon", "id", "Consensus")) {
+  id_cols <- intersect(id_cols, colnames(ra_tbl))
+  sample_cols <- setdiff(colnames(ra_tbl), id_cols)
+  ra_mat <- as.matrix(ra_tbl[, sample_cols, drop = FALSE])
+  storage.mode(ra_mat) <- "double"
+  list(
+    ra_mat = ra_mat,
+    feature_meta = ra_tbl[, id_cols, drop = FALSE],
+    sample_cols = sample_cols
+  )
+}
+
+clr_tbl_to_mat_int <- function(clr_tbl, id_cols = c("Sequence", "Taxon", "id", "Consensus")) {
+  id_cols <- intersect(id_cols, colnames(clr_tbl))
+  sample_cols <- setdiff(colnames(clr_tbl), id_cols)
+  clr_mat <- as.matrix(clr_tbl[, sample_cols, drop = FALSE])
+  storage.mode(clr_mat) <- "double"
+  list(
+    clr_mat = clr_mat,
+    feature_meta = clr_tbl[, id_cols, drop = FALSE],
+    sample_cols = sample_cols
+  )
+}
+
+to_relative_abundance <- function(df, id_cols = c("Sequence", "Taxon", "id", "Consensus")) {
+  count_cols <- setdiff(colnames(df), id_cols)
+  counts <- df[count_cols]
+  col_totals <- colSums(counts, na.rm = TRUE)
+  col_totals[col_totals == 0] <- NA_real_
+  ra <- sweep(counts, 2, col_totals, FUN = "/")
+  ra[is.na(ra)] <- 0
+  data.frame(df[id_cols], ra, check.names = FALSE)
+}
+
+to_clr <- function(ra_df, id_cols = c("Sequence", "Taxon", "id", "Consensus"), pseudo = NULL) {
+  count_cols <- setdiff(colnames(ra_df), id_cols)
+  mat <- as.matrix(ra_df[, count_cols, drop = FALSE])
+  storage.mode(mat) <- "double"
+  mat[is.na(mat)] <- 0
+  if (is.null(pseudo)) {
+    min_pos <- suppressWarnings(min(mat[mat > 0], na.rm = TRUE))
+    pseudo <- if (is.finite(min_pos)) min_pos / 2 else 1e-6
+  }
+  mat[mat == 0] <- pseudo
+  clr_mat <- sweep(log(mat), 2, colMeans(log(mat)), FUN = "-")
+  data.frame(ra_df[id_cols], clr_mat, check.names = FALSE)
+}
+
+compare_numeric_summaries <- function(all_tbl, hc_tbl, key_cols) {
+  common_keys <- intersect(names(all_tbl), names(hc_tbl))
+  key_cols <- intersect(key_cols, common_keys)
+  value_cols <- setdiff(common_keys, key_cols)
+
+  all_long <- all_tbl %>%
+    mutate(dataset = "35_all") %>%
+    pivot_longer(cols = all_of(value_cols), names_to = "metric", values_to = "value")
+
+  hc_long <- hc_tbl %>%
+    mutate(dataset = "35_hc") %>%
+    pivot_longer(cols = all_of(value_cols), names_to = "metric", values_to = "value")
+
+  bind_rows(all_long, hc_long) %>%
+    pivot_wider(names_from = dataset, values_from = value) %>%
+    mutate(delta_hc_minus_all = `35_hc` - `35_all`)
+}
+
+
+make_feature_key_int <- function(feature_meta,
+                                 preferred_cols = c("Sequence", "id", "Taxon", "Consensus")) {
+  use_cols <- intersect(preferred_cols, colnames(feature_meta))
+  if (length(use_cols) == 0) {
+    return(as.character(seq_len(nrow(feature_meta))))
+  }
+  do.call(paste, c(feature_meta[, use_cols, drop = FALSE], sep = "||"))
+}
+
+filter_features_for_clr_source <- function(ra_mat,
+                                           min_prevalence = 0.05,
+                                           min_mean_abundance = 1e-4) {
+  prevalence <- rowMeans(ra_mat > 0, na.rm = TRUE)
+  mean_abund <- rowMeans(ra_mat, na.rm = TRUE)
+  keep <- prevalence >= min_prevalence | mean_abund >= min_mean_abundance
+  if (sum(keep) < 10) {
+    warning("Too few features after filtering; returning original feature set.")
+    return(rep(TRUE, nrow(ra_mat)))
+  }
+  keep
+}
+
+make_clr_profile <- function(clr_mat, sample_names, summary_fun = c("median", "mean")) {
+  summary_fun <- match.arg(summary_fun)
+  sample_names <- intersect(sample_names, colnames(clr_mat))
+  if (length(sample_names) == 0) return(NULL)
+
+  vals <- clr_mat[, sample_names, drop = FALSE]
+  prof <- if (summary_fun == "median") {
+    apply(vals, 1, median, na.rm = TRUE)
+  } else {
+    rowMeans(vals, na.rm = TRUE)
+  }
+  prof[is.na(prof)] <- 0
+  prof
+}
+
+fit_simplex_mixture_clr <- function(y,
+                                    X,
+                                    lambda_ridge = 0) {
+  y <- as.numeric(y)
+  X <- as.matrix(X)
+  storage.mode(X) <- "double"
+
+  k <- ncol(X)
+  stopifnot(k >= 1L)
+
+  softmax <- function(z) {
+    z <- z - max(z)
+    ez <- exp(z)
+    ez / sum(ez)
+  }
+
+  obj_fun <- function(theta) {
+    w <- softmax(theta)
+    yhat_num <- drop(X %*% w)
+    sse <- sum((y - yhat_num)^2)
+    ridge <- lambda_ridge * sum(w^2)
+    sse + ridge
+  }
+
+  init <- rep(0, k)
+  fit <- optim(init, obj_fun, method = "BFGS", control = list(maxit = 5000))
+
+  w <- softmax(fit$par)
+  yhat_num <- drop(X %*% w)
+
+  sse <- sum((y - yhat_num)^2)
+  rmse <- sqrt(mean((y - yhat_num)^2))
+  sst <- sum((y - mean(y))^2)
+  r2 <- if (isTRUE(all.equal(sst, 0))) NA_real_ else 1 - sse / sst
+  cosine <- sum(y * yhat_num) / sqrt(sum(y^2) * sum(yhat_num^2))
+  err_vec_num <- (y - yhat_num)^2
+
+  tibble::tibble(
+    weight = list(w),
+    fit_sse = sse,
+    fit_rmse = rmse,
+    fit_r2 = r2,
+    fit_cosine = cosine,
+    converged = isTRUE(fit$convergence == 0),
+    yhat = list(yhat_num),
+    err_vec = list(err_vec_num)
+  )
+}
+
+subset_key_int <- function(x) {
+  x <- sort(unique(x))
+  if (length(x) == 0) return(".EMPTY.")
+  paste(x, collapse = "|")
+}
+
+all_subsets_int <- function(x) {
+  x <- unique(x)
+  out <- list(character(0))
+  if (length(x) == 0) return(out)
+  for (k in seq_along(x)) {
+    out <- c(out, combn(x, k, simplify = FALSE))
+  }
+  out
+}
+
+fit_subset_model_clr <- function(y,
+                                 profiles,
+                                 use_sources,
+                                 lambda_ridge = 0) {
+  use_sources <- intersect(use_sources, names(profiles))
+  y <- as.numeric(y)
+
+  if (length(use_sources) == 0) {
+    yhat0 <- rep(mean(y), length(y))
+    sse0 <- sum((y - yhat0)^2)
+    rmse0 <- sqrt(mean((y - yhat0)^2))
+    sst0 <- sum((y - mean(y))^2)
+    r20 <- if (isTRUE(all.equal(sst0, 0))) NA_real_ else 1 - sse0 / sst0
+    cos0 <- sum(y * yhat0) / sqrt(sum(y^2) * sum(yhat0^2))
+
+    return(tibble::tibble(
+      fit_sse = sse0,
+      fit_rmse = rmse0,
+      fit_r2 = r20,
+      fit_cosine = cos0,
+      converged = TRUE,
+      simplex_weight = list(setNames(numeric(0), character(0))),
+      yhat = list(yhat0),
+      err_vec = list((y - yhat0)^2)
+    ))
+  }
+
+  X_list <- lapply(profiles[use_sources], function(z) {
+    z_num <- as.numeric(z)
+    if (!is.numeric(z_num)) {
+      stop("Profile cannot be coerced to numeric.")
+    }
+    z_num
+  })
+
+  X <- do.call(cbind, X_list)
+  X <- as.matrix(X)
+  storage.mode(X) <- "double"
+
+  if (!is.numeric(y)) {
+    stop("y is not numeric after coercion.")
+  }
+  if (!is.matrix(X)) {
+    stop("X is not a matrix after coercion.")
+  }
+  if (!is.numeric(X)) {
+    stop("X is not numeric after coercion.")
+  }
+
+  fit <- fit_simplex_mixture_clr(
+    y = y,
+    X = X,
+    lambda_ridge = lambda_ridge
+  )
+
+  w <- as.numeric(fit$weight[[1]])
+  names(w) <- use_sources
+  yhat_num <- as.numeric(fit$yhat[[1]])
+
+  if (!is.numeric(yhat_num)) {
+    stop("yhat is not numeric after coercion.")
+  }
+
+  tibble::tibble(
+    fit_sse = as.numeric(fit$fit_sse[[1]]),
+    fit_rmse = as.numeric(fit$fit_rmse[[1]]),
+    fit_r2 = as.numeric(fit$fit_r2[[1]]),
+    fit_cosine = as.numeric(fit$fit_cosine[[1]]),
+    converged = isTRUE(fit$converged[[1]]),
+    simplex_weight = list(w),
+    yhat = list(yhat_num),
+    err_vec = list(as.numeric((y - yhat_num)^2))
+  )
+}
+
+empty_model_fit_int <- function(model_name,
+                                all_sources = c("HW_prev", "TW_prev", "Prev_PTW", "BLANK"),
+                                y_len = NA_integer_) {
+  out <- tibble::tibble(
+    model = model_name,
+    fit_sse = NA_real_,
+    fit_rmse = NA_real_,
+    fit_r2 = NA_real_,
+    fit_cosine = NA_real_,
+    converged = FALSE,
+    n_sources_model = 0,
+    yhat = list(if (is.na(y_len)) numeric(0) else rep(NA_real_, y_len)),
+    err_vec = list(if (is.na(y_len)) numeric(0) else rep(NA_real_, y_len))
+  )
+  for (nm in all_sources) out[[nm]] <- 0
+  out
+}
+
+fit_named_model_from_profiles_clr <- function(y,
+                                              profiles,
+                                              model_name,
+                                              lambda_ridge = 0,
+                                              all_sources = c("HW_prev", "TW_prev", "Prev_PTW", "BLANK")) {
+  available <- names(profiles)
+  has_ext <- any(c("HW_prev", "TW_prev") %in% available)
+  has_lag <- "Prev_PTW" %in% available
+
+  if (model_name == "M_blank") {
+    use_sources <- intersect(c("BLANK"), available)
+    if (length(use_sources) == 0) return(empty_model_fit_int(model_name, all_sources, length(y)))
+  } else if (model_name == "M_ext") {
+    if (!has_ext) return(empty_model_fit_int(model_name, all_sources, length(y)))
+    use_sources <- intersect(c("HW_prev", "TW_prev", "BLANK"), available)
+  } else if (model_name == "M_lag") {
+    if (!has_lag) return(empty_model_fit_int(model_name, all_sources, length(y)))
+    use_sources <- intersect(c("Prev_PTW", "BLANK"), available)
+  } else if (model_name == "M_full") {
+    if (!(has_ext && has_lag)) return(empty_model_fit_int(model_name, all_sources, length(y)))
+    use_sources <- intersect(c("Prev_PTW", "HW_prev", "TW_prev", "BLANK"), available)
+  } else {
+    stop("Unknown model_name: ", model_name)
+  }
+
+  fit <- fit_subset_model_clr(
+    y = y,
+    profiles = profiles,
+    use_sources = use_sources,
+    lambda_ridge = lambda_ridge
+  )
+
+  w <- fit$simplex_weight[[1]]
+  out <- tibble::tibble(
+    model = model_name,
+    fit_sse = fit$fit_sse[[1]],
+    fit_rmse = fit$fit_rmse[[1]],
+    fit_r2 = fit$fit_r2[[1]],
+    fit_cosine = fit$fit_cosine[[1]],
+    converged = fit$converged[[1]],
+    n_sources_model = length(use_sources),
+    yhat = fit$yhat,
+    err_vec = fit$err_vec
+  )
+  for (nm in all_sources) out[[nm]] <- 0
+  if (length(w) > 0) {
+    for (nm in names(w)) out[[nm]] <- unname(w[[nm]])
+  }
+  out %>% dplyr::select(dplyr::all_of(all_sources), dplyr::everything())
+}
+
+compute_shapley_explanatory_weights_clr <- function(y,
+                                                    profiles,
+                                                    lambda_ridge = 0,
+                                                    source_order = c("HW_prev", "TW_prev", "Prev_PTW", "BLANK"),
+                                                    value_col = c("fit_r2", "fit_cosine"),
+                                                    truncate_negative = TRUE) {
+  value_col <- match.arg(value_col)
+
+  src <- intersect(source_order, names(profiles))
+
+  out0 <- tibble(
+    source = source_order,
+    available = source_order %in% src,
+    shapley_value = 0,
+    explanatory_weight = 0
+  )
+
+  if (length(src) == 0) {
+    return(out0)
+  }
+
+  # 先算所有 subset 的 value function
+  subset_list <- all_subsets_int(src)
+
+  subset_vals <- purrr::map_dbl(subset_list, function(S) {
+    fit <- fit_subset_model_clr(
+      y = y,
+      profiles = profiles,
+      use_sources = S,
+      lambda_ridge = lambda_ridge
+    )
+    val <- fit[[value_col]][[1]]
+    if (is.na(val)) val <- 0
+    if (isTRUE(truncate_negative)) val <- max(0, val)
+    val
+  })
+
+  subset_keys <- purrr::map_chr(subset_list, subset_key_int)
+  value_map <- stats::setNames(subset_vals, subset_keys)
+
+  n <- length(src)
+  fact_n <- factorial(n)
+
+  shap <- stats::setNames(rep(0, n), src)
+
+  for (i in src) {
+    others <- setdiff(src, i)
+    subsets_others <- all_subsets_int(others)
+
+    for (S in subsets_others) {
+      k <- length(S)
+      coeff <- factorial(k) * factorial(n - k - 1) / fact_n
+
+      key_S <- subset_key_int(S)
+      key_Si <- subset_key_int(c(S, i))
+
+      v_S <- value_map[[key_S]]
+      v_Si <- value_map[[key_Si]]
+
+      shap[[i]] <- shap[[i]] + coeff * (v_Si - v_S)
+    }
+  }
+
+  shap_pos <- pmax(shap, 0)
+  denom <- sum(shap_pos)
+
+  if (denom <= 0) {
+    fit_full <- fit_subset_model_clr(
+      y = y,
+      profiles = profiles,
+      use_sources = src,
+      lambda_ridge = lambda_ridge
+    )
+    w_raw <- fit_full$simplex_weight[[1]]
+
+    expl <- rep(0, length(src))
+    names(expl) <- src
+
+    if (length(w_raw) > 0 && sum(w_raw) > 0) {
+      expl[names(w_raw)] <- w_raw / sum(w_raw)
+    }
+  } else {
+    expl <- shap_pos / denom
+  }
+
+  out <- out0
+  out$shapley_value[match(src, out$source)] <- unname(shap)
+  out$explanatory_weight[match(src, out$source)] <- unname(expl)
+
+  out
+}
+
+collapse_explanatory_groups_int <- function(expl_tbl) {
+  tibble(
+    blank_support = sum(expl_tbl$explanatory_weight[expl_tbl$source == "BLANK"], na.rm = TRUE),
+    lag_support = sum(expl_tbl$explanatory_weight[expl_tbl$source == "Prev_PTW"], na.rm = TRUE),
+    external_support = sum(expl_tbl$explanatory_weight[expl_tbl$source %in% c("HW_prev", "TW_prev")], na.rm = TRUE),
+    hw_within_external = {
+      ext <- expl_tbl %>% filter(source %in% c("HW_prev", "TW_prev"))
+      s <- sum(ext$explanatory_weight, na.rm = TRUE)
+      if (s > 0) sum(ext$explanatory_weight[ext$source == "HW_prev"], na.rm = TRUE) / s else NA_real_
+    },
+    tw_within_external = {
+      ext <- expl_tbl %>% filter(source %in% c("HW_prev", "TW_prev"))
+      s <- sum(ext$explanatory_weight, na.rm = TRUE)
+      if (s > 0) sum(ext$explanatory_weight[ext$source == "TW_prev"], na.rm = TRUE) / s else NA_real_
+    }
+  )
+}
+
+
+make_window_summary <- function(window_days = 1L) {
+  if (window_days <= 1L) "prev_day" else paste0("recent_", window_days, "d")
+}
+
+make_external_summary_int <- function(external_window_days = 1L,
+                                      external_profile_mode = c("summary", "decay")) {
+  external_profile_mode <- match.arg(external_profile_mode)
+  base <- make_window_summary(external_window_days)
+  if (external_profile_mode == "decay") paste0(base, "_decay") else base
+}
+
+make_weighted_clr_profile <- function(clr_mat, sample_names, raw_weights) {
+  sample_names <- intersect(sample_names, colnames(clr_mat))
+  if (length(sample_names) == 0) return(NULL)
+
+  vals <- clr_mat[, sample_names, drop = FALSE]
+  w <- raw_weights[seq_along(sample_names)]
+  w[is.na(w)] <- 0
+  if (sum(w) <= 0) w <- rep(1, length(sample_names))
+  w <- w / sum(w)
+
+  prof <- as.vector(vals %*% w)
+  prof[is.na(prof)] <- 0
+  prof
+}
+
+prepare_filtered_clr_inputs <- function(ra_tbl,
+                                        id_cols,
+                                        clr_tbl = NULL,
+                                        min_prevalence = 0.05,
+                                        min_mean_abundance = 1e-4,
+                                        pseudocount = 0.5,
+                                        use_existing_clr = TRUE) {
+  ra_info <- ra_tbl_to_mat_int(ra_tbl, id_cols = id_cols)
+
+  sample_cols <- colnames(ra_info$ra_mat)
+  feature_meta <- ra_info$feature_meta
+
+  keep_features <- filter_features_for_clr_source(
+    ra_info$ra_mat,
+    min_prevalence = min_prevalence,
+    min_mean_abundance = min_mean_abundance
+  )
+
+  ra_mat_filt <- ra_info$ra_mat[keep_features, , drop = FALSE]
+  feature_meta_filt <- feature_meta[keep_features, , drop = FALSE]
+
+  if (!is.null(clr_tbl) && isTRUE(use_existing_clr)) {
+    clr_info <- clr_tbl_to_mat_int(clr_tbl, id_cols = id_cols)
+
+    common_samples <- intersect(colnames(ra_mat_filt), colnames(clr_info$clr_mat))
+    if (length(common_samples) == 0) {
+      stop("No overlapping sample columns between filtered RA table and provided CLR table.")
+    }
+
+    ra_mat_filt <- ra_mat_filt[, common_samples, drop = FALSE]
+    clr_mat_raw <- clr_info$clr_mat[, common_samples, drop = FALSE]
+
+    ra_key <- make_feature_key_int(feature_meta_filt)
+    clr_key <- make_feature_key_int(clr_info$feature_meta)
+    common_key <- intersect(ra_key, clr_key)
+    if (length(common_key) == 0) {
+      stop("No overlapping features between filtered RA table and provided CLR table.")
+    }
+
+    ra_idx <- match(common_key, ra_key)
+    clr_idx <- match(common_key, clr_key)
+
+    ra_mat_filt <- ra_mat_filt[ra_idx, , drop = FALSE]
+    clr_mat_filt <- clr_mat_raw[clr_idx, , drop = FALSE]
+    feature_meta_filt <- clr_info$feature_meta[clr_idx, , drop = FALSE]
+    storage.mode(clr_mat_filt) <- "double"
+  } else {
+    ra_pc <- ra_mat_filt + pseudocount
+    gm <- exp(colMeans(log(t(ra_pc))))
+    clr_mat_filt <- log(ra_pc / gm)
+    storage.mode(clr_mat_filt) <- "double"
+  }
+
+  list(
+    ra_mat = ra_mat_filt,
+    clr_mat = clr_mat_filt,
+    feature_meta = feature_meta_filt,
+    sample_cols = colnames(ra_mat_filt),
+    keep_features = keep_features
+  )
+}
+
+add_day_from_start_int <- function(meta_ptw) {
+  if (nrow(meta_ptw) == 0) return(meta_ptw)
+
+  meta_ptw %>%
+    dplyr::group_by(ptrap) %>%
+    dplyr::arrange(date, .by_group = TRUE) %>%
+    dplyr::mutate(day_from_start = as.integer(date - min(date, na.rm = TRUE))) %>%
+    dplyr::ungroup()
+}
+
+compute_ptw_grouped_support_tbl_clr <- function(meta_ptw,
+                                                clr_mat,
+                                                meta_hw_tw,
+                                                blank_profile = NULL,
+                                                include_prev_ptw = TRUE,
+                                                summary_fun = c("median", "mean"),
+                                                external_window_days = 1L,
+                                                external_profile_mode = c("summary", "decay"),
+                                                external_decay_rate = 0.8,
+                                                lambda_ridge = 0) {
+  summary_fun <- match.arg(summary_fun)
+  external_profile_mode <- match.arg(external_profile_mode)
+
+  if (nrow(meta_ptw) == 0) {
+    return(tibble::tibble(
+      Sample.Name = character(),
+      external_support = numeric(),
+      lag_support = numeric(),
+      blank_support = numeric(),
+      hw_within_external = numeric(),
+      tw_within_external = numeric()
+    ))
+  }
+
+  purrr::map_dfr(meta_ptw$Sample.Name, function(smp) {
+    y <- clr_mat[, smp]
+
+    cand <- build_candidate_sources_for_one_ptw_clr(
+      target_sample = smp,
+      clr_mat = clr_mat,
+      meta_ptw = meta_ptw,
+      meta_hw_tw = meta_hw_tw,
+      blank_profile = blank_profile,
+      include_prev_ptw = include_prev_ptw,
+      summary_fun = summary_fun,
+      external_window_days = external_window_days,
+      external_profile_mode = external_profile_mode,
+      external_decay_rate = external_decay_rate
+    )
+
+    if (is.null(cand$profiles) || length(cand$profiles) == 0) {
+      tibble::tibble(
+        Sample.Name = smp,
+        external_support = 0,
+        lag_support = 0,
+        blank_support = 0,
+        hw_within_external = NA_real_,
+        tw_within_external = NA_real_
+      )
+    } else {
+      expl_tbl <- compute_shapley_explanatory_weights_clr(
+        y = y,
+        profiles = cand$profiles,
+        lambda_ridge = lambda_ridge,
+        source_order = c("HW_prev", "TW_prev", "Prev_PTW", "BLANK"),
+        value_col = "fit_r2",
+        truncate_negative = TRUE
+      )
+
+      group_tbl <- collapse_explanatory_groups_int(expl_tbl)
+
+      tibble::tibble(
+        Sample.Name = smp,
+        external_support = dplyr::coalesce(group_tbl$external_support[[1]], 0),
+        lag_support = dplyr::coalesce(group_tbl$lag_support[[1]], 0),
+        blank_support = dplyr::coalesce(group_tbl$blank_support[[1]], 0),
+        hw_within_external = group_tbl$hw_within_external[[1]],
+        tw_within_external = group_tbl$tw_within_external[[1]]
+      )
+    }
+  })
+}
+
+compute_regime_signal_from_support_int <- function(external_support,
+                                                   lag_support,
+                                                   metric = c("external_fraction_nonblank", "external_minus_lag", "log_external_over_lag"),
+                                                   pseudocount = 1e-4) {
+  metric <- match.arg(metric)
+  external_support <- dplyr::coalesce(as.numeric(external_support), 0)
+  lag_support <- dplyr::coalesce(as.numeric(lag_support), 0)
+
+  if (metric == "external_fraction_nonblank") {
+    return(external_support / (external_support + lag_support + pseudocount))
+  }
+  if (metric == "external_minus_lag") {
+    return(external_support - lag_support)
+  }
+  log((external_support + pseudocount) / (lag_support + pseudocount))
+}
+
+describe_regime_metric_int <- function(metric = c("external_fraction_nonblank", "external_minus_lag", "log_external_over_lag")) {
+  metric <- match.arg(metric)
+
+  if (metric == "external_fraction_nonblank") {
+    return(list(
+      title = "Support-driven regime signal (external / [external + lag])",
+      y = "external support fraction among non-blank support"
+    ))
+  }
+  if (metric == "external_minus_lag") {
+    return(list(
+      title = "Support-driven regime signal (external - lag)",
+      y = "external support minus lag support"
+    ))
+  }
+  list(
+    title = "Support-driven regime signal (log[(external + pc)/(lag + pc)])",
+    y = "log external-to-lag support"
+  )
+}
+
+assign_support_driven_regime_int <- function(meta_ptw,
+                                             support_tbl,
+                                             metric = c("external_fraction_nonblank", "external_minus_lag", "log_external_over_lag"),
+                                             pseudocount = 1e-4,
+                                             early_day_max = 14L,
+                                             mid_day_max = 35L) {
+  metric <- match.arg(metric)
+  if (nrow(meta_ptw) == 0) return(meta_ptw)
+
+  out <- meta_ptw %>%
+    add_day_from_start_int() %>%
+    dplyr::left_join(support_tbl, by = "Sample.Name") %>%
+    dplyr::mutate(
+      external_support = dplyr::coalesce(external_support, 0),
+      lag_support = dplyr::coalesce(lag_support, 0),
+      blank_support = dplyr::coalesce(blank_support, 0),
+      regime_signal = compute_regime_signal_from_support_int(
+        external_support = external_support,
+        lag_support = lag_support,
+        metric = metric,
+        pseudocount = pseudocount
+      ),
+      regime_break_day = as.numeric(early_day_max),
+      regime_break_day_2 = as.numeric(mid_day_max)
+    ) %>%
+    add_phase_columns_int(early_day_max = early_day_max, mid_day_max = mid_day_max)
+
+  attr(out, "regime_metric") <- metric
+  attr(out, "regime_assignment") <- "fixed_day"
+  attr(out, "early_day_max") <- early_day_max
+  attr(out, "mid_day_max") <- mid_day_max
+  out
+}
+
+summarise_regime_assignments_int <- function(meta_ptw) {
+  early_day_max <- attr(meta_ptw, "early_day_max") %||% 14L
+  mid_day_max <- attr(meta_ptw, "mid_day_max") %||% 35L
+
+  meta_ptw %>%
+    dplyr::group_by(ptrap) %>%
+    dplyr::summarise(
+      n_samples = dplyr::n(),
+      early_end_day = early_day_max,
+      mid_end_day = mid_day_max,
+      n_early = sum(phase == "early", na.rm = TRUE),
+      n_mid = sum(phase == "mid", na.rm = TRUE),
+      n_late = sum(phase == "late", na.rm = TRUE),
+      max_regime_signal = max(regime_signal, na.rm = TRUE),
+      mean_external_support = mean(external_support, na.rm = TRUE),
+      mean_lag_support = mean(lag_support, na.rm = TRUE),
+      mean_blank_support = mean(blank_support, na.rm = TRUE),
+      .groups = "drop"
+    )
+}
+
+plot_regime_signal_int <- function(meta_ptw, title = NULL) {
+  metric_desc <- describe_regime_metric_int(attr(meta_ptw, "regime_metric") %||% "external_fraction_nonblank")
+  early_day_max <- attr(meta_ptw, "early_day_max") %||% 14L
+  mid_day_max <- attr(meta_ptw, "mid_day_max") %||% 35L
+
+  ggplot2::ggplot(meta_ptw, ggplot2::aes(x = day_from_start, y = regime_signal, color = phase)) +
+    ggplot2::geom_line(ggplot2::aes(group = 1), color = "grey60") +
+    ggplot2::geom_point(size = 2) +
+    ggplot2::geom_vline(xintercept = c(early_day_max, mid_day_max), linetype = 2) +
+    ggplot2::facet_wrap(~ ptrap, ncol = 1, scales = "free_x") +
+    ggplot2::theme_bw() +
+    ggplot2::labs(
+      title = title %||% "Fixed-day regime support signal",
+      subtitle = paste0("Fixed-day phase definition (<=", early_day_max, ", <=", mid_day_max, "); signal = ", metric_desc),
+      x = "days from start",
+      y = "support-derived regime signal",
+      color = "phase"
+    )
+}
+
+run_early_late_taxon_attribution_clr <- function(clr_tbl,
+                                                 ra_tbl,
+                                                 metadata,
+                                                 pcr_keep,
+                                                 ptw_ptraps = c(1, 2, 3),
+                                                 include_prev_ptw = TRUE,
+                                                 summary_fun = c("median", "mean"),
+                                                 min_prevalence = 0.05,
+                                                 min_mean_abundance = 1e-4,
+                                                 blank_patterns = c("^blank", "water_blank"),
+                                                 keep_phases = c("early", "late"),
+                                                 external_window_days = 1L,
+                                                 external_profile_mode = c("summary", "decay"),
+                                                 external_decay_rate = 0.8,
+                                                 lambda_ridge = 0,
+                                                 regime_metric = c("external_fraction_nonblank", "external_minus_lag", "log_external_over_lag"),
+                                                 regime_pseudocount = 1e-4) {
+  summary_fun <- match.arg(summary_fun)
+  regime_metric <- match.arg(regime_metric)
+
+  prep <- prepare_filtered_clr_inputs(
+    ra_tbl = ra_tbl,
+    clr_tbl = clr_tbl,
+    id_cols = id_cols,
+    min_prevalence = min_prevalence,
+    min_mean_abundance = min_mean_abundance,
+    pseudocount = 0.5
+  )
+
+  ra_mat <- prep$ra_mat
+  clr_mat <- prep$clr_mat
+  feature_meta <- prep$feature_meta %>%
+    dplyr::mutate(feature_index = dplyr::row_number())
+
+  meta_sub <- metadata %>%
+    filter(PCR.cycles == pcr_keep) %>%
+    mutate(
+      date = if ("date" %in% names(.)) as.Date(date) else extract_date_from_name_int(Sample.Name),
+      ptrap = if ("ptrap" %in% names(.)) ptrap else extract_ptrap_from_name_int(Sample.Name)
+    )
+
+  meta_ptw <- meta_sub %>%
+    filter(Phenotype == "PTW", ptrap %in% ptw_ptraps) %>%
+    filter(Sample.Name %in% colnames(clr_mat)) %>%
+    add_day_from_start_int()
+
+  meta_hw_tw <- meta_sub %>%
+    filter(Phenotype %in% c("HW", "TW")) %>%
+    filter(Sample.Name %in% colnames(clr_mat)) %>%
+    arrange(date)
+
+  blank_from_name <- meta_sub %>%
+    filter(Sample.Name %in% colnames(clr_mat)) %>%
+    filter(grepl(paste(blank_patterns, collapse = "|"), Sample.Name, ignore.case = TRUE))
+
+  blank_from_type <- if ("Phenotype" %in% names(meta_sub)) {
+    meta_sub %>%
+      filter(Sample.Name %in% colnames(clr_mat)) %>%
+      filter(grepl("blank", Phenotype, ignore.case = TRUE))
+  } else {
+    tibble()
+  }
+
+  blank_samples <- bind_rows(blank_from_name, blank_from_type) %>%
+    distinct(Sample.Name, .keep_all = TRUE)
+
+  blank_profile <- NULL
+  if (nrow(blank_samples) > 0) {
+    blank_profile <- make_clr_profile(clr_mat, blank_samples$Sample.Name, summary_fun = summary_fun)
+  }
+
+  support_tbl <- compute_ptw_grouped_support_tbl_clr(
+    meta_ptw = meta_ptw,
+    clr_mat = clr_mat,
+    meta_hw_tw = meta_hw_tw,
+    blank_profile = blank_profile,
+    include_prev_ptw = include_prev_ptw,
+    summary_fun = summary_fun,
+    external_window_days = external_window_days,
+    external_profile_mode = external_profile_mode,
+    external_decay_rate = external_decay_rate,
+    lambda_ridge = lambda_ridge
+  )
+
+  meta_ptw <- assign_support_driven_regime_int(
+    meta_ptw = meta_ptw,
+    support_tbl = support_tbl,
+    metric = regime_metric,
+    pseudocount = regime_pseudocount
+  )
+
+  feature_level_tbl <- purrr::map_dfr(meta_ptw$Sample.Name, function(smp) {
+    row_now <- meta_ptw %>% filter(Sample.Name == smp)
+    y <- clr_mat[, smp]
+
+    cand <- build_candidate_sources_for_one_ptw_clr(
+      target_sample = smp,
+      clr_mat = clr_mat,
+      meta_ptw = meta_ptw,
+      meta_hw_tw = meta_hw_tw,
+      blank_profile = blank_profile,
+      include_prev_ptw = include_prev_ptw,
+      summary_fun = summary_fun,
+      external_window_days = external_window_days,
+      external_profile_mode = external_profile_mode,
+      external_decay_rate = external_decay_rate
+    )
+
+    profiles <- cand$profiles
+
+    fit_blank <- fit_named_model_from_profiles_clr(
+      y = y,
+      profiles = profiles,
+      model_name = "M_blank",
+      lambda_ridge = lambda_ridge
+    )
+
+    fit_ext <- fit_named_model_from_profiles_clr(
+      y = y,
+      profiles = profiles,
+      model_name = "M_ext",
+      lambda_ridge = lambda_ridge
+    )
+
+    fit_lag <- fit_named_model_from_profiles_clr(
+      y = y,
+      profiles = profiles,
+      model_name = "M_lag",
+      lambda_ridge = lambda_ridge
+    )
+
+    fit_full <- fit_named_model_from_profiles_clr(
+      y = y,
+      profiles = profiles,
+      model_name = "M_full",
+      lambda_ridge = lambda_ridge
+    )
+
+    err_blank <- if (!all(is.na(fit_blank$err_vec[[1]]))) fit_blank$err_vec[[1]] else rep(NA_real_, length(y))
+    err_ext   <- if (!all(is.na(fit_ext$err_vec[[1]])))   fit_ext$err_vec[[1]]   else rep(NA_real_, length(y))
+    err_lag   <- if (!all(is.na(fit_lag$err_vec[[1]])))   fit_lag$err_vec[[1]]   else rep(NA_real_, length(y))
+    err_full  <- if (!all(is.na(fit_full$err_vec[[1]])))  fit_full$err_vec[[1]]  else rep(NA_real_, length(y))
+
+    tibble(
+      Sample.Name = smp,
+      ptrap = row_now$ptrap[[1]],
+      date = row_now$date[[1]],
+      day_from_start = row_now$day_from_start[[1]],
+      phase = row_now$phase[[1]],
+      feature_index = feature_meta$feature_index,
+      observed_clr = y,
+      observed_ra = ra_mat[, smp],
+      yhat_blank = if (!is.null(fit_blank)) fit_blank$yhat[[1]] else NA_real_,
+      yhat_ext = if (!is.null(fit_ext)) fit_ext$yhat[[1]] else NA_real_,
+      yhat_lag = if (!is.null(fit_lag)) fit_lag$yhat[[1]] else NA_real_,
+      yhat_full = if (!is.null(fit_full)) fit_full$yhat[[1]] else NA_real_,
+      improve_ext_over_blank = err_blank - err_ext,
+      improve_lag_over_blank = err_blank - err_lag,
+      improve_full_over_lag = err_lag - err_full,
+      improve_full_over_ext = err_ext - err_full
+    ) %>%
+      left_join(feature_meta, by = "feature_index")
+  }) %>%
+    mutate(
+      phase = factor(phase, levels = c("early", "mid", "late")),
+      taxon_label = if ("Taxon" %in% names(.)) as.character(Taxon) else as.character(id)
+    )
+
+  taxon_phase_summary <- feature_level_tbl %>%
+    filter(as.character(phase) %in% keep_phases) %>%
+    group_by(phase, taxon_label) %>%
+    summarise(
+      n_samples = n_distinct(Sample.Name),
+      prevalence_in_phase = mean(observed_ra > 0, na.rm = TRUE),
+      mean_observed_clr = mean(observed_clr, na.rm = TRUE),
+      median_observed_clr = median(observed_clr, na.rm = TRUE),
+      mean_observed_ra = mean(observed_ra, na.rm = TRUE),
+      median_observed_ra = median(observed_ra, na.rm = TRUE),
+      sum_imp_ext_over_blank = sum(improve_ext_over_blank, na.rm = TRUE),
+      mean_imp_ext_over_blank = mean(improve_ext_over_blank, na.rm = TRUE),
+      median_imp_ext_over_blank = median(improve_ext_over_blank, na.rm = TRUE),
+      prop_pos_ext_over_blank = mean(improve_ext_over_blank > 0, na.rm = TRUE),
+      sum_imp_lag_over_blank = sum(improve_lag_over_blank, na.rm = TRUE),
+      mean_imp_lag_over_blank = mean(improve_lag_over_blank, na.rm = TRUE),
+      median_imp_lag_over_blank = median(improve_lag_over_blank, na.rm = TRUE),
+      prop_pos_lag_over_blank = mean(improve_lag_over_blank > 0, na.rm = TRUE),
+      sum_imp_full_over_lag = sum(improve_full_over_lag, na.rm = TRUE),
+      mean_imp_full_over_lag = mean(improve_full_over_lag, na.rm = TRUE),
+      median_imp_full_over_lag = median(improve_full_over_lag, na.rm = TRUE),
+      prop_pos_full_over_lag = mean(improve_full_over_lag > 0, na.rm = TRUE),
+      sum_imp_full_over_ext = sum(improve_full_over_ext, na.rm = TRUE),
+      mean_imp_full_over_ext = mean(improve_full_over_ext, na.rm = TRUE),
+      median_imp_full_over_ext = median(improve_full_over_ext, na.rm = TRUE),
+      prop_pos_full_over_ext = mean(improve_full_over_ext > 0, na.rm = TRUE),
+      .groups = "drop"
+    )
+
+  early_external_taxa <- taxon_phase_summary %>%
+    filter(phase == "early", prevalence_in_phase >= 0.10, n_samples >= 3) %>%
+    arrange(desc(sum_imp_full_over_lag), desc(mean_imp_full_over_lag))
+
+  late_persistent_taxa <- taxon_phase_summary %>%
+    filter(phase == "late", prevalence_in_phase >= 0.10, n_samples >= 5) %>%
+    arrange(desc(sum_imp_lag_over_blank), desc(mean_imp_lag_over_blank))
+
+  lag_phase_contrast <- taxon_phase_summary %>%
+    filter(phase %in% c("early", "late")) %>%
+    select(
+      phase, taxon_label,
+      prevalence_in_phase,
+      mean_observed_ra,
+      sum_imp_lag_over_blank,
+      mean_imp_lag_over_blank,
+      prop_pos_lag_over_blank
+    ) %>%
+    pivot_wider(
+      names_from = phase,
+      values_from = c(prevalence_in_phase, mean_observed_ra,
+                      sum_imp_lag_over_blank, mean_imp_lag_over_blank,
+                      prop_pos_lag_over_blank),
+      names_sep = "_"
+    ) %>%
+    mutate(
+      delta_mean_imp_lag_late_minus_early = mean_imp_lag_over_blank_late - mean_imp_lag_over_blank_early,
+      delta_sum_imp_lag_late_minus_early = sum_imp_lag_over_blank_late - sum_imp_lag_over_blank_early
+    ) %>%
+    arrange(desc(delta_mean_imp_lag_late_minus_early))
+
+  plot_top_taxa_int <- function(tbl, value_col, title, top_n = 15) {
+    value_col <- rlang::ensym(value_col)
+    plot_tbl <- tbl %>%
+      slice_head(n = top_n) %>%
+      mutate(taxon_label = forcats::fct_reorder(taxon_label, !!value_col))
+
+    ggplot(plot_tbl, aes(x = taxon_label, y = !!value_col)) +
+      geom_col() +
+      coord_flip() +
+      theme_bw() +
+      labs(title = title, x = NULL, y = rlang::as_name(value_col))
+  }
+
+  p_top_early_external <- plot_top_taxa_int(
+    early_external_taxa,
+    sum_imp_full_over_lag,
+    title = paste0("Top pre-shift external-attributed taxa (full over lag; CLR; ", make_external_summary_int(external_window_days, external_profile_mode), ")"),
+    top_n = 15
+  )
+
+  p_top_late_persistent <- plot_top_taxa_int(
+    late_persistent_taxa,
+    sum_imp_lag_over_blank,
+    title = paste0("Top post-shift persistent taxa (lag over blank; CLR; ", make_external_summary_int(external_window_days, external_profile_mode), ")"),
+    top_n = 15
+  )
+
+  list(
+    feature_level_tbl = feature_level_tbl,
+    taxon_phase_summary = taxon_phase_summary,
+    early_external_taxa = early_external_taxa,
+    late_persistent_taxa = late_persistent_taxa,
+    lag_phase_contrast = lag_phase_contrast,
+    p_top_early_external = p_top_early_external,
+    p_top_late_persistent = p_top_late_persistent,
+    regime_summary = summarise_regime_assignments_int(meta_ptw),
+    p_regime_signal = plot_regime_signal_int(meta_ptw, title = paste0("Fixed-day regime support signal (PCR ", pcr_keep, ")")),
+    external_window_days = external_window_days,
+    external_profile_mode = external_profile_mode,
+    external_decay_rate = external_decay_rate
+  )
+}
+
+build_candidate_sources_for_one_ptw_clr <- function(target_sample,
+                                                    clr_mat,
+                                                    meta_ptw,
+                                                    meta_hw_tw,
+                                                    blank_profile = NULL,
+                                                    include_prev_ptw = TRUE,
+                                                    summary_fun = c("median", "mean"),
+                                                    external_window_days = 1L,
+                                                    external_profile_mode = c("summary", "decay"),
+                                                    external_decay_rate = 0.8,
+                                                    require_same_sampling_time = FALSE,
+                                                    treated_ptraps = c(1L, 3L),
+                                                    control_ptrap = 2L) {
+  summary_fun <- match.arg(summary_fun)
+  external_profile_mode <- match.arg(external_profile_mode)
+  external_window_days <- as.integer(external_window_days)
+
+  row_now <- meta_ptw %>% dplyr::filter(Sample.Name == target_sample)
+  if (nrow(row_now) != 1) {
+    stop("target_sample not uniquely found in meta_ptw: ", target_sample)
+  }
+
+  current_date <- row_now$date[[1]]
+  current_ptrap <- row_now$ptrap[[1]]
+  current_sampling_time <- row_now$sampling_time[[1]]
+
+  ext_candidates <- meta_hw_tw %>%
+    dplyr::filter(
+      date < current_date,
+      date >= current_date - external_window_days
+    )
+
+  if (isTRUE(require_same_sampling_time) && "sampling_time" %in% names(ext_candidates)) {
+    ext_candidates <- ext_candidates %>%
+      dplyr::filter(sampling_time == current_sampling_time)
+  }
+
+  ext_candidates <- ext_candidates %>%
+    dplyr::mutate(
+      label_chr = as.character(label),
+      ptrap_chr = as.character(ptrap),
+      shared_treated_input = ptrap_chr == "a" | label_chr %in% c("Pa", "Aa"),
+      ptrap_match = dplyr::case_when(
+        current_ptrap %in% treated_ptraps & shared_treated_input ~ TRUE,
+        !is.na(ptrap_chr) ~ ptrap_chr == as.character(current_ptrap),
+        TRUE ~ FALSE
+      )
+    ) %>%
+    dplyr::filter(ptrap_match)
+
+  build_ext_profile_int <- function(phenotype_now) {
+    sub <- ext_candidates %>%
+      dplyr::filter(Phenotype == phenotype_now) %>%
+      dplyr::arrange(dplyr::desc(date))
+
+    smps <- sub$Sample.Name
+    if (length(smps) == 0) {
+      return(list(profile = NULL, samples = character(0), weight_string = ""))
+    }
+
+    if (external_profile_mode == "decay") {
+      day_lag <- as.numeric(current_date - sub$date)
+      day_lag[is.na(day_lag)] <- external_window_days
+      raw_w <- exp(-external_decay_rate * pmax(day_lag, 1))
+      prof <- make_weighted_clr_profile(clr_mat, smps, raw_w)
+      weight_string <- paste0(smps, ":", round(raw_w / sum(raw_w), 3), collapse = ";")
+    } else {
+      prof <- make_clr_profile(clr_mat, smps, summary_fun = summary_fun)
+      weight_string <- "uniform_summary"
+    }
+
+    list(profile = prof, samples = smps, weight_string = weight_string)
+  }
+
+  hw_info <- list(profile = NULL, samples = character(0), weight_string = "")
+  tw_info <- list(profile = NULL, samples = character(0), weight_string = "")
+
+  hw_info <- build_ext_profile_int("HW")
+  tw_info <- build_ext_profile_int("TW")
+
+  prev_ptw_sample <- NA_character_
+  prev_prof <- NULL
+  if (isTRUE(include_prev_ptw)) {
+    prev_ptw_sample <- meta_ptw %>%
+      dplyr::filter(ptrap == current_ptrap, date < current_date) %>%
+      dplyr::arrange(dplyr::desc(date)) %>%
+      dplyr::slice(1) %>%
+      dplyr::pull(Sample.Name)
+
+    if (length(prev_ptw_sample) == 1 && !is.na(prev_ptw_sample)) {
+      prev_prof <- make_clr_profile(clr_mat, prev_ptw_sample, summary_fun = summary_fun)
+    } else {
+      prev_ptw_sample <- NA_character_
+      prev_prof <- NULL
+    }
+  }
+
+  profiles <- list()
+  if (!is.null(hw_info$profile)) profiles$HW_prev <- hw_info$profile
+  if (!is.null(tw_info$profile)) profiles$TW_prev <- tw_info$profile
+  if (!is.null(prev_prof)) profiles$Prev_PTW <- prev_prof
+  if (!is.null(blank_profile)) profiles$BLANK <- blank_profile
+
+  X <- NULL
+  if (length(profiles) > 0) X <- do.call(cbind, profiles)
+
+  list(
+    profiles = profiles,
+    X = X,
+    details = list(
+      HW_prev_samples = paste(hw_info$samples, collapse = ";"),
+      TW_prev_samples = paste(tw_info$samples, collapse = ";"),
+      HW_prev_weight_string = hw_info$weight_string,
+      TW_prev_weight_string = tw_info$weight_string,
+      Prev_PTW_sample = if (length(prev_ptw_sample) == 0) "" else prev_ptw_sample,
+      external_window = make_external_summary_int(external_window_days, external_profile_mode),
+      allowed_external = "matched_prev_day_HW_or_TW"
+    )
+  )
+}
+
+add_phase_columns_int <- function(df,
+                                  early_day_max = 14L,
+                                  mid_day_max = 35L) {
+  if (!"day_from_start" %in% names(df)) {
+    df <- df %>%
+      dplyr::group_by(ptrap) %>%
+      dplyr::arrange(date, .by_group = TRUE) %>%
+      dplyr::mutate(day_from_start = as.integer(date - min(date, na.rm = TRUE))) %>%
+      dplyr::ungroup()
+  }
+
+  df %>%
+    dplyr::mutate(
+      phase = dplyr::case_when(
+        day_from_start <= early_day_max ~ "early",
+        day_from_start <= mid_day_max ~ "mid",
+        TRUE ~ "late"
+      ),
+      phase = factor(phase, levels = c("early", "mid", "late"))
+    )
+}
+
+summarise_grouped_support_tbl <- function(fit_tbl, group_vars = NULL) {
+  df <- add_phase_columns_int(fit_tbl)
+  if (is.null(group_vars) || length(group_vars) == 0) {
+    df %>%
+      dplyr::summarise(
+        n_samples = dplyr::n(),
+        median_external_support = median(external_support, na.rm = TRUE),
+        median_lag_support = median(lag_support, na.rm = TRUE),
+        median_blank_support = median(blank_support, na.rm = TRUE),
+        mean_external_support = mean(external_support, na.rm = TRUE),
+        mean_lag_support = mean(lag_support, na.rm = TRUE),
+        mean_blank_support = mean(blank_support, na.rm = TRUE)
+      )
+  } else {
+    df %>%
+      dplyr::group_by(dplyr::across(dplyr::all_of(group_vars))) %>%
+      dplyr::summarise(
+        n_samples = dplyr::n(),
+        median_external_support = median(external_support, na.rm = TRUE),
+        median_lag_support = median(lag_support, na.rm = TRUE),
+        median_blank_support = median(blank_support, na.rm = TRUE),
+        mean_external_support = mean(external_support, na.rm = TRUE),
+        mean_lag_support = mean(lag_support, na.rm = TRUE),
+        mean_blank_support = mean(blank_support, na.rm = TRUE),
+        .groups = "drop"
+      )
+  }
+}
+
+bootstrap_nested_delta_ci <- function(comparison_tbl,
+                                      group_vars = NULL,
+                                      n_boot = 500L,
+                                      seed = 1L) {
+  metrics <- c(
+    "delta_lag_over_blank",
+    "delta_ext_over_blank",
+    "delta_full_over_lag",
+    "delta_full_over_ext"
+  )
+
+  summarise_once_int <- function(df) {
+    if (is.null(group_vars) || length(group_vars) == 0) {
+      df %>%
+        dplyr::summarise(dplyr::across(dplyr::all_of(metrics), ~ median(.x, na.rm = TRUE)))
+    } else {
+      df %>%
+        dplyr::group_by(dplyr::across(dplyr::all_of(group_vars))) %>%
+        dplyr::summarise(dplyr::across(dplyr::all_of(metrics), ~ median(.x, na.rm = TRUE)), .groups = "drop")
+    }
+  }
+
+  resample_once_int <- function(df) {
+    if (is.null(group_vars) || length(group_vars) == 0) {
+      df[sample.int(nrow(df), size = nrow(df), replace = TRUE), , drop = FALSE]
+    } else {
+      df %>%
+        dplyr::group_by(dplyr::across(dplyr::all_of(group_vars))) %>%
+        dplyr::group_modify(~ .x[sample.int(nrow(.x), size = nrow(.x), replace = TRUE), , drop = FALSE]) %>%
+        dplyr::ungroup()
+    }
+  }
+
+  point_est <- summarise_once_int(comparison_tbl) %>%
+    tidyr::pivot_longer(cols = dplyr::all_of(metrics), names_to = "statistic", values_to = "estimate")
+
+  set.seed(seed)
+  boot_tbl <- purrr::map_dfr(seq_len(n_boot), function(b) {
+    resample_once_int(comparison_tbl) %>%
+      summarise_once_int() %>%
+      dplyr::mutate(.boot = b)
+  }) %>%
+    tidyr::pivot_longer(cols = dplyr::all_of(metrics), names_to = "statistic", values_to = "value")
+
+  ci_tbl <- if (is.null(group_vars) || length(group_vars) == 0) {
+    boot_tbl %>%
+      dplyr::group_by(statistic) %>%
+      dplyr::summarise(
+        ci_low = stats::quantile(value, 0.025, na.rm = TRUE),
+        ci_high = stats::quantile(value, 0.975, na.rm = TRUE),
+        .groups = "drop"
+      )
+  } else {
+    boot_tbl %>%
+      dplyr::group_by(dplyr::across(dplyr::all_of(group_vars)), statistic) %>%
+      dplyr::summarise(
+        ci_low = stats::quantile(value, 0.025, na.rm = TRUE),
+        ci_high = stats::quantile(value, 0.975, na.rm = TRUE),
+        .groups = "drop"
+      )
+  }
+
+  dplyr::left_join(point_est, ci_tbl, by = c(group_vars, "statistic"))
+}
+
+run_ptw_clr_source_model <- function(clr_tbl,
+                                     ra_tbl,
+                                     metadata,
+                                     pcr_keep,
+                                     ptw_ptraps = c(1, 2, 3),
+                                     include_prev_ptw = TRUE,
+                                     summary_fun = c("median", "mean"),
+                                     min_prevalence = 0.05,
+                                     min_mean_abundance = 1e-4,
+                                     blank_patterns = c("^blank", "water_blank"),
+                                     external_window_days = 1L,
+                                     external_profile_mode = c("summary", "decay"),
+                                     external_decay_rate = 0.8,
+                                     lambda_ridge = 0,
+                                     title_suffix = NULL,
+                                     regime_metric = c("external_fraction_nonblank", "external_minus_lag", "log_external_over_lag"),
+                                     regime_pseudocount = 1e-4,
+                                     prep = NULL) {
+  summary_fun <- match.arg(summary_fun)
+  regime_metric <- match.arg(regime_metric)
+  external_profile_mode <- match.arg(external_profile_mode)
+  title_suffix <- title_suffix %||% paste0("PCR ", pcr_keep)
+
+  if (is.null(prep)) {
+    prep <- prepare_filtered_clr_inputs(
+      ra_tbl = ra_tbl,
+      clr_tbl = clr_tbl,
+      id_cols = id_cols,
+      min_prevalence = min_prevalence,
+      min_mean_abundance = min_mean_abundance,
+      pseudocount = 0.5
+    )
+  }
+
+
+  ra_mat <- prep$ra_mat
+  clr_mat <- prep$clr_mat
+  feature_meta <- prep$feature_meta
+
+  meta_sub <- metadata %>%
+    dplyr::filter(PCR.cycles == pcr_keep) %>%
+    dplyr::mutate(
+      date = if ("date" %in% names(.)) as.Date(date) else extract_date_from_name_int(Sample.Name),
+      ptrap = if ("ptrap" %in% names(.)) ptrap else extract_ptrap_from_name_int(Sample.Name)
+    )
+  if (!("sampling_time" %in% names(meta_sub))) meta_sub$sampling_time <- NA_character_
+
+  meta_ptw <- meta_sub %>%
+    dplyr::filter(Phenotype == "PTW", ptrap %in% ptw_ptraps) %>%
+    dplyr::filter(Sample.Name %in% colnames(clr_mat)) %>%
+    add_day_from_start_int()
+
+  meta_hw_tw <- meta_sub %>%
+    dplyr::filter(Phenotype %in% c("HW", "TW")) %>%
+    dplyr::filter(Sample.Name %in% colnames(clr_mat)) %>%
+    dplyr::arrange(date)
+
+  blank_from_name <- meta_sub %>%
+    dplyr::filter(Sample.Name %in% colnames(clr_mat)) %>%
+    dplyr::filter(grepl(paste(blank_patterns, collapse = "|"), Sample.Name, ignore.case = TRUE))
+
+  blank_from_type <- if ("Phenotype" %in% names(meta_sub)) {
+    meta_sub %>%
+      dplyr::filter(Sample.Name %in% colnames(clr_mat)) %>%
+      dplyr::filter(grepl("blank", Phenotype, ignore.case = TRUE))
+  } else {
+    tibble::tibble()
+  }
+
+  blank_samples <- dplyr::bind_rows(blank_from_name, blank_from_type) %>%
+    dplyr::distinct(Sample.Name, .keep_all = TRUE)
+
+  blank_profile <- NULL
+  if (nrow(blank_samples) > 0) {
+    blank_profile <- make_clr_profile(clr_mat, blank_samples$Sample.Name, summary_fun = summary_fun)
+  }
+
+  all_source_names <- c("HW_prev", "TW_prev", "Prev_PTW", "BLANK")
+
+  fit_tbl <- purrr::map_dfr(meta_ptw$Sample.Name, function(smp) {
+    row_now <- meta_ptw %>% dplyr::filter(Sample.Name == smp)
+    y <- clr_mat[, smp]
+
+    cand <- build_candidate_sources_for_one_ptw_clr(
+      target_sample = smp,
+      clr_mat = clr_mat,
+      meta_ptw = meta_ptw,
+      meta_hw_tw = meta_hw_tw,
+      blank_profile = blank_profile,
+      include_prev_ptw = include_prev_ptw,
+      summary_fun = summary_fun,
+      external_window_days = external_window_days,
+      external_profile_mode = external_profile_mode,
+      external_decay_rate = external_decay_rate
+    )
+
+    if (is.null(cand$profiles) || length(cand$profiles) == 0) {
+      fit_res <- tibble::tibble(
+        fit_sse = NA_real_, fit_rmse = NA_real_, fit_r2 = NA_real_, fit_cosine = NA_real_, converged = FALSE
+      )
+      for (nm in all_source_names) {
+        fit_res[[nm]] <- 0
+        fit_res[[paste0(nm, "_simplex")]] <- 0
+        fit_res[[paste0(nm, "_shapley")]] <- 0
+      }
+      fit_res$blank_support <- 0
+      fit_res$lag_support <- 0
+      fit_res$external_support <- 0
+      fit_res$hw_within_external <- NA_real_
+      fit_res$tw_within_external <- NA_real_
+      fit_res$n_sources <- 0
+    } else {
+      fit_full <- fit_subset_model_clr(
+        y = y,
+        profiles = cand$profiles,
+        use_sources = names(cand$profiles),
+        lambda_ridge = lambda_ridge
+      )
+
+      expl_tbl <- compute_shapley_explanatory_weights_clr(
+        y = y,
+        profiles = cand$profiles,
+        lambda_ridge = lambda_ridge,
+        source_order = all_source_names,
+        value_col = "fit_r2",
+        truncate_negative = TRUE
+      )
+
+      group_tbl <- collapse_explanatory_groups_int(expl_tbl)
+      w_raw <- fit_full$simplex_weight[[1]]
+
+      fit_res <- tibble::tibble(
+        fit_sse = fit_full$fit_sse,
+        fit_rmse = fit_full$fit_rmse,
+        fit_r2 = fit_full$fit_r2,
+        fit_cosine = fit_full$fit_cosine,
+        converged = fit_full$converged
+      )
+      for (nm in all_source_names) {
+        fit_res[[nm]] <- 0
+        fit_res[[paste0(nm, "_simplex")]] <- 0
+        fit_res[[paste0(nm, "_shapley")]] <- 0
+      }
+      for (i in seq_len(nrow(expl_tbl))) {
+        nm <- expl_tbl$source[[i]]
+        fit_res[[nm]] <- expl_tbl$explanatory_weight[[i]]
+        fit_res[[paste0(nm, "_shapley")]] <- expl_tbl$shapley_value[[i]]
+      }
+      if (length(w_raw) > 0) {
+        for (nm in names(w_raw)) fit_res[[paste0(nm, "_simplex")]] <- unname(w_raw[[nm]])
+      }
+      fit_res$blank_support <- group_tbl$blank_support
+      fit_res$lag_support <- group_tbl$lag_support
+      fit_res$external_support <- group_tbl$external_support
+      fit_res$hw_within_external <- group_tbl$hw_within_external
+      fit_res$tw_within_external <- group_tbl$tw_within_external
+      fit_res$n_sources <- length(cand$profiles)
+    }
+
+    fit_res %>%
+      dplyr::mutate(
+        Sample.Name = smp,
+        day_from_start = row_now$day_from_start[[1]],
+        PCR.cycles = row_now$PCR.cycles[[1]],
+        Phenotype = row_now$Phenotype[[1]],
+        ptrap = row_now$ptrap[[1]],
+        date = row_now$date[[1]],
+        candidate_HW_prev = cand$details$HW_prev_samples != "",
+        candidate_TW_prev = cand$details$TW_prev_samples != "",
+        candidate_Prev_PTW = !is.na(cand$details$Prev_PTW_sample) && cand$details$Prev_PTW_sample != "",
+        candidate_BLANK = !is.null(blank_profile),
+        HW_prev_samples = cand$details$HW_prev_samples,
+        TW_prev_samples = cand$details$TW_prev_samples,
+        HW_prev_weight_string = cand$details$HW_prev_weight_string,
+        TW_prev_weight_string = cand$details$TW_prev_weight_string,
+        Prev_PTW_sample = cand$details$Prev_PTW_sample,
+        external_window = cand$details$external_window
+      )
+  }) %>%
+    dplyr::relocate(
+      Sample.Name, PCR.cycles, Phenotype, ptrap, date, external_window,
+      n_sources,
+      candidate_HW_prev, candidate_TW_prev, candidate_Prev_PTW, candidate_BLANK,
+      HW_prev_samples, TW_prev_samples, HW_prev_weight_string, TW_prev_weight_string, Prev_PTW_sample,
+      external_support, lag_support, blank_support,
+      HW_prev, TW_prev, Prev_PTW, BLANK,
+      HW_prev_simplex, TW_prev_simplex, Prev_PTW_simplex, BLANK_simplex,
+      HW_prev_shapley, TW_prev_shapley, Prev_PTW_shapley, BLANK_shapley,
+      fit_sse, fit_rmse, fit_r2, fit_cosine, converged
+    ) %>%
+    dplyr::arrange(ptrap, date)
+
+  meta_ptw <- assign_support_driven_regime_int(
+    meta_ptw = meta_ptw,
+    support_tbl = fit_tbl %>% dplyr::select(Sample.Name, external_support, lag_support, blank_support),
+    metric = regime_metric,
+    pseudocount = regime_pseudocount
+  )
+
+  fit_tbl <- fit_tbl %>%
+    dplyr::left_join(
+      meta_ptw %>%
+        dplyr::select(Sample.Name, phase, regime_break_day, regime_break_day_2, regime_signal),
+      by = "Sample.Name"
+    ) %>%
+    dplyr::arrange(ptrap, date)
+
+  weights_long <- fit_tbl %>%
+    dplyr::select(Sample.Name, ptrap, date, HW_prev, TW_prev, Prev_PTW, BLANK, fit_r2) %>%
+    tidyr::pivot_longer(cols = c(HW_prev, TW_prev, Prev_PTW, BLANK), names_to = "source", values_to = "weight")
+
+  support_long <- fit_tbl %>%
+    dplyr::select(Sample.Name, ptrap, date, external_support, lag_support, blank_support) %>%
+    tidyr::pivot_longer(cols = c(external_support, lag_support, blank_support), names_to = "support_type", values_to = "support")
+
+  p_weights <- ggplot2::ggplot(weights_long, ggplot2::aes(x = date, y = weight, fill = source)) +
+    ggplot2::geom_area(position = "stack", alpha = 0.9) +
+    ggplot2::facet_wrap(~ ptrap, ncol = 1, scales = "free_x") +
+    ggplot2::theme_bw() +
+    ggplot2::labs(
+      title = paste0("Dynamic source explanation by time (", title_suffix, "; ", make_external_summary_int(external_window_days, external_profile_mode), "; CLR/Shapley)"),
+      x = NULL,
+      y = "explanatory weight"
+    )
+
+  p_support <- ggplot2::ggplot(support_long, ggplot2::aes(x = date, y = support, fill = support_type)) +
+    ggplot2::geom_area(position = "stack", alpha = 0.9) +
+    ggplot2::facet_wrap(~ ptrap, ncol = 1, scales = "free_x") +
+    ggplot2::theme_bw() +
+    ggplot2::labs(
+      title = paste0("Dynamic grouped explanatory support (", title_suffix, "; ", make_external_summary_int(external_window_days, external_profile_mode), ")"),
+      x = NULL,
+      y = "grouped explanatory support"
+    )
+
+  p_fit <- fit_tbl %>%
+    ggplot2::ggplot(ggplot2::aes(x = date, y = fit_r2, color = factor(ptrap), group = ptrap)) +
+    ggplot2::geom_line() +
+    ggplot2::geom_point(size = 1.8) +
+    ggplot2::theme_bw() +
+    ggplot2::labs(
+      title = paste0("Dynamic mixture fit quality across time (", title_suffix, "; ", make_external_summary_int(external_window_days, external_profile_mode), "; CLR)"),
+      x = NULL,
+      y = "fit R2 (CLR)",
+      color = "ptrap"
+    )
+
+  list(
+    fit_tbl = fit_tbl,
+    weights_long = weights_long,
+    support_long = support_long,
+    p_weights = p_weights,
+    p_support = p_support,
+    p_fit = p_fit,
+    p_regime_signal = plot_regime_signal_int(meta_ptw, title = paste0("Fixed-day regime support signal (", title_suffix, ")")),
+    regime_summary = summarise_regime_assignments_int(meta_ptw),
+    ra_mat = ra_mat,
+    clr_mat = clr_mat,
+    feature_meta = feature_meta,
+    blank_samples = blank_samples,
+    meta_ptw = meta_ptw,
+    meta_hw_tw = meta_hw_tw,
+    external_window_days = external_window_days,
+    external_profile_mode = external_profile_mode,
+    external_decay_rate = external_decay_rate
+  )
+}
+
+run_ptw_clr_nested_model_comparison <- function(clr_tbl,
+                                                ra_tbl,
+                                                metadata,
+                                                pcr_keep,
+                                                ptw_ptraps = c(1, 2, 3),
+                                                include_prev_ptw = TRUE,
+                                                summary_fun = c("median", "mean"),
+                                                min_prevalence = 0.05,
+                                                min_mean_abundance = 1e-4,
+                                                blank_patterns = c("^blank", "water_blank"),
+                                                external_window_days = 1L,
+                                                external_profile_mode = c("summary", "decay"),
+                                                external_decay_rate = 0.8,
+                                                lambda_ridge = 0,
+                                                title_suffix = NULL,
+                                                regime_metric = c("external_fraction_nonblank", "external_minus_lag", "log_external_over_lag"),
+                                                regime_pseudocount = 1e-4,
+                                                prep = NULL) {
+  summary_fun <- match.arg(summary_fun)
+  regime_metric <- match.arg(regime_metric)
+  external_profile_mode <- match.arg(external_profile_mode)
+  title_suffix <- title_suffix %||% paste0("PCR ", pcr_keep)
+
+  if (is.null(prep)) {
+    prep <- prepare_filtered_clr_inputs(
+      ra_tbl = ra_tbl,
+      clr_tbl = clr_tbl,
+      id_cols = id_cols,
+      min_prevalence = min_prevalence,
+      min_mean_abundance = min_mean_abundance,
+      pseudocount = 0.5
+    )
+  }
+
+  ra_mat <- prep$ra_mat
+  clr_mat <- prep$clr_mat
+  feature_meta <- prep$feature_meta
+
+  meta_sub <- metadata %>%
+    dplyr::filter(PCR.cycles == pcr_keep) %>%
+    dplyr::mutate(
+      date = if ("date" %in% names(.)) as.Date(date) else extract_date_from_name_int(Sample.Name),
+      ptrap = if ("ptrap" %in% names(.)) ptrap else extract_ptrap_from_name_int(Sample.Name)
+    )
+  if (!("sampling_time" %in% names(meta_sub))) meta_sub$sampling_time <- NA_character_
+
+  meta_ptw <- meta_sub %>%
+    dplyr::filter(Phenotype == "PTW", ptrap %in% ptw_ptraps) %>%
+    dplyr::filter(Sample.Name %in% colnames(clr_mat)) %>%
+    add_day_from_start_int() %>%
+    dplyr::arrange(ptrap, date)
+
+  meta_hw_tw <- meta_sub %>%
+    dplyr::filter(Phenotype %in% c("HW", "TW")) %>%
+    dplyr::filter(Sample.Name %in% colnames(clr_mat)) %>%
+    dplyr::arrange(date)
+
+  blank_from_name <- meta_sub %>%
+    dplyr::filter(Sample.Name %in% colnames(clr_mat)) %>%
+    dplyr::filter(grepl(paste(blank_patterns, collapse = "|"), Sample.Name, ignore.case = TRUE))
+
+  blank_from_type <- if ("Phenotype" %in% names(meta_sub)) {
+    meta_sub %>% dplyr::filter(Sample.Name %in% colnames(clr_mat)) %>% dplyr::filter(grepl("blank", Phenotype, ignore.case = TRUE))
+  } else {
+    tibble::tibble()
+  }
+
+  blank_samples <- dplyr::bind_rows(blank_from_name, blank_from_type) %>% dplyr::distinct(Sample.Name, .keep_all = TRUE)
+  blank_profile <- NULL
+  if (nrow(blank_samples) > 0) blank_profile <- make_clr_profile(clr_mat, blank_samples$Sample.Name, summary_fun = summary_fun)
+
+  support_tbl <- compute_ptw_grouped_support_tbl_clr(
+    meta_ptw = meta_ptw,
+    clr_mat = clr_mat,
+    meta_hw_tw = meta_hw_tw,
+    blank_profile = blank_profile,
+    include_prev_ptw = include_prev_ptw,
+    summary_fun = summary_fun,
+    external_window_days = external_window_days,
+    external_profile_mode = external_profile_mode,
+    external_decay_rate = external_decay_rate,
+    lambda_ridge = lambda_ridge
+  )
+
+  meta_ptw <- assign_support_driven_regime_int(
+    meta_ptw = meta_ptw,
+    support_tbl = support_tbl,
+    metric = regime_metric,
+    pseudocount = regime_pseudocount
+  )
+
+  model_results_long <- purrr::map_dfr(meta_ptw$Sample.Name, function(smp) {
+    row_now <- meta_ptw %>% dplyr::filter(Sample.Name == smp)
+    y <- clr_mat[, smp]
+
+    cand <- build_candidate_sources_for_one_ptw_clr(
+      target_sample = smp,
+      clr_mat = clr_mat,
+      meta_ptw = meta_ptw,
+      meta_hw_tw = meta_hw_tw,
+      blank_profile = blank_profile,
+      include_prev_ptw = include_prev_ptw,
+      summary_fun = summary_fun,
+      external_window_days = external_window_days,
+      external_profile_mode = external_profile_mode,
+      external_decay_rate = external_decay_rate
+    )
+
+    profiles <- cand$profiles
+    model_names <- c("M_blank", "M_ext", "M_lag", "M_full")
+
+    purrr::map_dfr(model_names, function(mn) {
+      fit <- fit_named_model_from_profiles_clr(
+        y = y,
+        profiles = profiles,
+        model_name = mn,
+        lambda_ridge = lambda_ridge
+      )
+
+      fit %>%
+        dplyr::mutate(
+          Sample.Name = smp,
+          ptrap = row_now$ptrap[[1]],
+          date = row_now$date[[1]],
+          has_HW_prev = cand$details$HW_prev_samples != "",
+          has_TW_prev = cand$details$TW_prev_samples != "",
+          has_Prev_PTW = !is.na(cand$details$Prev_PTW_sample) && cand$details$Prev_PTW_sample != "",
+          has_BLANK = !is.null(blank_profile),
+          HW_prev_samples = cand$details$HW_prev_samples,
+          TW_prev_samples = cand$details$TW_prev_samples,
+          HW_prev_weight_string = cand$details$HW_prev_weight_string,
+          TW_prev_weight_string = cand$details$TW_prev_weight_string,
+          Prev_PTW_sample = cand$details$Prev_PTW_sample,
+          external_window = cand$details$external_window
+        )
+    })
+  }) %>%
+    dplyr::select(
+      Sample.Name, ptrap, date, external_window, model,
+      has_HW_prev, has_TW_prev, has_Prev_PTW, has_BLANK,
+      HW_prev, TW_prev, Prev_PTW, BLANK,
+      HW_prev_samples, TW_prev_samples, HW_prev_weight_string, TW_prev_weight_string, Prev_PTW_sample,
+      fit_sse, fit_rmse, fit_r2, fit_cosine, converged, n_sources_model
+    ) %>%
+    dplyr::arrange(ptrap, date, model)
+
+  comparison_tbl <- model_results_long %>%
+    dplyr::select(Sample.Name, ptrap, date, external_window, model, fit_r2, fit_rmse, fit_cosine, n_sources_model,
+           has_HW_prev, has_TW_prev, has_Prev_PTW, has_BLANK,
+           HW_prev_samples, TW_prev_samples, Prev_PTW_sample) %>%
+    tidyr::pivot_wider(names_from = model, values_from = c(fit_r2, fit_rmse, fit_cosine, n_sources_model), names_glue = "{.value}_{model}") %>%
+    dplyr::left_join(
+      meta_ptw %>%
+        dplyr::select(Sample.Name, day_from_start, phase, regime_break_day,
+                      regime_break_day_2, regime_signal),
+      by = "Sample.Name"
+    ) %>%
+    dplyr::mutate(
+      delta_lag_over_blank = fit_r2_M_lag - fit_r2_M_blank,
+      delta_ext_over_blank = fit_r2_M_ext - fit_r2_M_blank,
+      delta_full_over_lag = fit_r2_M_full - fit_r2_M_lag,
+      delta_full_over_ext = fit_r2_M_full - fit_r2_M_ext
+    ) %>%
+    dplyr::arrange(ptrap, date)
+  
+  comparison_tbl <- comparison_tbl %>%
+    dplyr::mutate(
+      treatment_group = dplyr::case_when(
+        ptrap %in% c(1, 3) ~ "treated",
+        ptrap == 2 ~ "control",
+        TRUE ~ "other"
+      )
+    )
+
+  overall_summary <- comparison_tbl %>%
+    dplyr::summarise(
+      n_samples = dplyr::n(),
+      n_ext_available = sum(has_HW_prev | has_TW_prev, na.rm = TRUE),
+      n_lag_available = sum(has_Prev_PTW, na.rm = TRUE),
+      n_full_available = sum((has_HW_prev | has_TW_prev) & has_Prev_PTW, na.rm = TRUE),
+      median_r2_blank = median(fit_r2_M_blank, na.rm = TRUE),
+      median_r2_ext = median(fit_r2_M_ext, na.rm = TRUE),
+      median_r2_lag = median(fit_r2_M_lag, na.rm = TRUE),
+      median_r2_full = median(fit_r2_M_full, na.rm = TRUE),
+      median_delta_lag_over_blank = median(delta_lag_over_blank, na.rm = TRUE),
+      median_delta_ext_over_blank = median(delta_ext_over_blank, na.rm = TRUE),
+      median_delta_full_over_lag = median(delta_full_over_lag, na.rm = TRUE),
+      median_delta_full_over_ext = median(delta_full_over_ext, na.rm = TRUE),
+      prop_delta_lag_over_blank_pos = mean(delta_lag_over_blank > 0, na.rm = TRUE),
+      prop_delta_ext_over_blank_pos = mean(delta_ext_over_blank > 0, na.rm = TRUE),
+      prop_delta_full_over_lag_pos = mean(delta_full_over_lag > 0, na.rm = TRUE),
+      prop_delta_full_over_ext_pos = mean(delta_full_over_ext > 0, na.rm = TRUE)
+    )
+
+  phase_summary <- comparison_tbl %>%
+    dplyr::group_by(phase) %>%
+    dplyr::summarise(
+      n_samples = dplyr::n(),
+      median_r2_blank = median(fit_r2_M_blank, na.rm = TRUE),
+      median_r2_ext = median(fit_r2_M_ext, na.rm = TRUE),
+      median_r2_lag = median(fit_r2_M_lag, na.rm = TRUE),
+      median_r2_full = median(fit_r2_M_full, na.rm = TRUE),
+      median_delta_lag_over_blank = median(delta_lag_over_blank, na.rm = TRUE),
+      median_delta_ext_over_blank = median(delta_ext_over_blank, na.rm = TRUE),
+      median_delta_full_over_lag = median(delta_full_over_lag, na.rm = TRUE),
+      median_delta_full_over_ext = median(delta_full_over_ext, na.rm = TRUE),
+      prop_delta_lag_over_blank_pos = mean(delta_lag_over_blank > 0, na.rm = TRUE),
+      prop_delta_ext_over_blank_pos = mean(delta_ext_over_blank > 0, na.rm = TRUE),
+      prop_delta_full_over_lag_pos = mean(delta_full_over_lag > 0, na.rm = TRUE),
+      prop_delta_full_over_ext_pos = mean(delta_full_over_ext > 0, na.rm = TRUE),
+      .groups = "drop"
+    )
+
+  ptrap_summary <- comparison_tbl %>%
+    dplyr::group_by(ptrap) %>%
+    dplyr::summarise(
+      n_samples = dplyr::n(),
+      median_r2_blank = median(fit_r2_M_blank, na.rm = TRUE),
+      median_r2_ext = median(fit_r2_M_ext, na.rm = TRUE),
+      median_r2_lag = median(fit_r2_M_lag, na.rm = TRUE),
+      median_r2_full = median(fit_r2_M_full, na.rm = TRUE),
+      median_delta_lag_over_blank = median(delta_lag_over_blank, na.rm = TRUE),
+      median_delta_ext_over_blank = median(delta_ext_over_blank, na.rm = TRUE),
+      median_delta_full_over_lag = median(delta_full_over_lag, na.rm = TRUE),
+      median_delta_full_over_ext = median(delta_full_over_ext, na.rm = TRUE),
+      .groups = "drop"
+    )
+
+  p_model_r2 <- model_results_long %>%
+    dplyr::mutate(model = factor(model, levels = c("M_blank", "M_ext", "M_lag", "M_full"))) %>%
+    ggplot2::ggplot(ggplot2::aes(x = date, y = fit_r2, color = model, group = model)) +
+    ggplot2::geom_line() +
+    ggplot2::geom_point(size = 1.5) +
+    ggplot2::facet_wrap(~ ptrap, ncol = 1, scales = "free_x") +
+    ggplot2::theme_bw() +
+    ggplot2::labs(
+      title = paste0("Nested model comparison across time (", title_suffix, "; ", make_external_summary_int(external_window_days, external_profile_mode), "; CLR)"),
+      x = NULL,
+      y = "fit R2 (CLR)",
+      color = "model"
+    )
+
+  delta_long <- comparison_tbl %>%
+    dplyr::select(Sample.Name, ptrap, date, phase, delta_lag_over_blank, delta_ext_over_blank, delta_full_over_lag, delta_full_over_ext) %>%
+    tidyr::pivot_longer(cols = tidyselect::starts_with("delta_"), names_to = "comparison", values_to = "delta_r2")
+
+  p_delta_by_phase <- ggplot2::ggplot(delta_long, ggplot2::aes(x = phase, y = delta_r2)) +
+    ggplot2::geom_hline(yintercept = 0, linetype = 2) +
+    ggplot2::geom_jitter(width = 0.15, height = 0, alpha = 0.6) +
+    ggplot2::facet_wrap(~ comparison, scales = "free_y") +
+    ggplot2::theme_bw() +
+    ggplot2::labs(
+      title = paste0("R2 gain by fixed-day phase (", title_suffix, "; ", make_external_summary_int(external_window_days, external_profile_mode), "; CLR)"),
+      x = NULL,
+      y = "delta R2"
+    )
+
+  list(
+    model_results_long = model_results_long,
+    comparison_tbl = comparison_tbl,
+    overall_summary = overall_summary,
+    phase_summary = phase_summary,
+    ptrap_summary = ptrap_summary,
+    regime_summary = summarise_regime_assignments_int(meta_ptw),
+    p_model_r2 = p_model_r2,
+    p_delta_by_phase = p_delta_by_phase,
+    p_regime_signal = plot_regime_signal_int(meta_ptw, title = paste0("Fixed-day regime support signal (", title_suffix, ")")),
+    blank_samples = blank_samples,
+    meta_ptw = meta_ptw,
+    meta_hw_tw = meta_hw_tw,
+    external_window_days = external_window_days,
+    external_profile_mode = external_profile_mode,
+    external_decay_rate = external_decay_rate
+  )
+}
+
+run_source_suite_with_sensitivity <- function(clr_tbl,
+                                              ra_tbl,
+                                              metadata,
+                                              pcr_keep,
+                                              title_base,
+                                              external_specs = NULL,
+                                              lambda_ridge = 0.01,
+                                              n_boot_ci = 500L,
+                                              seed_boot_ci = 1L,
+                                              min_prevalence = 0.05,
+                                              min_mean_abundance = 1e-4,
+                                              ...) {
+
+  prep_shared <- prepare_filtered_clr_inputs(
+    ra_tbl = ra_tbl,
+    clr_tbl = clr_tbl,
+    id_cols = id_cols,
+    min_prevalence = min_prevalence,
+    min_mean_abundance = min_mean_abundance,
+    pseudocount = 0.5
+  )
+
+  if (is.null(external_specs)) {
+    external_specs <- tibble::tibble(
+      spec_id = c("prev_day", "recent_3d", "recent_3d_decay"),
+      external_window_days = c(1L, 3L, 3L),
+      external_profile_mode = c("summary", "summary", "decay"),
+      external_decay_rate = c(NA_real_, NA_real_, 0.8)
+    )
+  }
+
+  dyn_list <- purrr::pmap(external_specs, function(spec_id, external_window_days, external_profile_mode, external_decay_rate) {
+    run_ptw_clr_source_model(
+      clr_tbl = clr_tbl,
+      ra_tbl = ra_tbl,
+      metadata = metadata,
+      pcr_keep = pcr_keep,
+      external_window_days = external_window_days,
+      external_profile_mode = external_profile_mode,
+      external_decay_rate = ifelse(is.na(external_decay_rate), 0.8, external_decay_rate),
+      lambda_ridge = lambda_ridge,
+      title_suffix = title_base,
+      min_prevalence = min_prevalence,
+      min_mean_abundance = min_mean_abundance,
+      prep = prep_shared,
+      ...
+    )
+  })
+  names(dyn_list) <- external_specs$spec_id
+
+  cmp_list <- purrr::pmap(external_specs, function(spec_id, external_window_days, external_profile_mode, external_decay_rate) {
+    run_ptw_clr_nested_model_comparison(
+      clr_tbl = clr_tbl,
+      ra_tbl = ra_tbl,
+      metadata = metadata,
+      pcr_keep = pcr_keep,
+      external_window_days = external_window_days,
+      external_profile_mode = external_profile_mode,
+      external_decay_rate = ifelse(is.na(external_decay_rate), 0.8, external_decay_rate),
+      lambda_ridge = lambda_ridge,
+      title_suffix = title_base,
+      min_prevalence = min_prevalence,
+      min_mean_abundance = min_mean_abundance,
+      prep = prep_shared,
+      ...
+    )
+  })
+  names(cmp_list) <- external_specs$spec_id
+
+  sens_summary <- purrr::imap_dfr(cmp_list, function(x, nm) {
+    x$overall_summary %>% dplyr::mutate(external_spec = nm, title_base = title_base)
+  })
+
+  phase_sensitivity <- purrr::imap_dfr(cmp_list, function(x, nm) {
+    x$phase_summary %>% dplyr::mutate(external_spec = nm, title_base = title_base)
+  })
+
+  support_overall <- purrr::imap_dfr(dyn_list, function(x, nm) {
+    summarise_grouped_support_tbl(x$fit_tbl) %>% dplyr::mutate(external_spec = nm, title_base = title_base)
+  })
+
+  support_by_phase <- purrr::imap_dfr(dyn_list, function(x, nm) {
+    summarise_grouped_support_tbl(x$fit_tbl, group_vars = "phase") %>% dplyr::mutate(external_spec = nm, title_base = title_base)
+  })
+
+  delta_ci_overall <- purrr::imap_dfr(cmp_list, function(x, nm) {
+    bootstrap_nested_delta_ci(
+      x$comparison_tbl,
+      group_vars = NULL,
+      n_boot = n_boot_ci,
+      seed = seed_boot_ci + match(nm, names(cmp_list))
+    ) %>% dplyr::mutate(external_spec = nm, title_base = title_base)
+  })
+
+  delta_ci_by_phase <- purrr::imap_dfr(cmp_list, function(x, nm) {
+    bootstrap_nested_delta_ci(
+      x$comparison_tbl,
+      group_vars = "phase",
+      n_boot = n_boot_ci,
+      seed = seed_boot_ci + 100 + match(nm, names(cmp_list))
+    ) %>% dplyr::mutate(external_spec = nm, title_base = title_base)
+  })
+
+  list(
+    dynamic = dyn_list,
+    comparison = cmp_list,
+    sensitivity_overall = sens_summary,
+    sensitivity_by_phase = phase_sensitivity,
+    support_overall = support_overall,
+    support_by_phase = support_by_phase,
+    delta_ci_overall = delta_ci_overall,
+    delta_ci_by_phase = delta_ci_by_phase,
+    external_specs = external_specs
+  )
+}
+```
+
+# run CLR source-support suites
+
+```{r}
+vsearch_clr_692_clean_with_blanks_int <- to_clr(vsearch_ra_692_clean_with_blanks, id_cols = id_cols)
+
+keep_samples_35_hc_with_blanks_int <- sample_qc_35 %>%
+  filter((!is_nonbiol_control & confidence_class == "high_confidence") | is_nonpcr_blank) %>%
+  pull(Sample.Name)
+
+count_35_clean_hc_with_blanks_int <- count_35_decontam %>%
+  select(any_of(c(id_cols, keep_samples_35_hc_with_blanks_int)))
+
+vsearch_ra_692_clean_hc_with_blanks_int <- to_relative_abundance(
+  count_35_clean_hc_with_blanks_int,
+  id_cols = id_cols
+)
+
+vsearch_clr_692_clean_hc_with_blanks_int <- to_clr(
+  vsearch_ra_692_clean_hc_with_blanks_int,
+  id_cols = id_cols
+)
+
+external_specs_source <- tibble::tibble(
+  spec_id = c("prev_day", "recent_3d", "recent_3d_decay"),
+  external_window_days = c(1L, 3L, 3L),
+  external_profile_mode = c("summary", "summary", "decay"),
+  external_decay_rate = c(NA_real_, NA_real_, 0.8)
+)
+
+n_boot_nested_ci <- 500L
+
+vsearch_clr_691_clean_with_blanks_int <- to_clr(
+  vsearch_ra_691_clean_with_blanks,
+  id_cols = id_cols
+)
+
+source_suite_25 <- run_source_suite_with_sensitivity(
+  clr_tbl = vsearch_clr_691_clean_with_blanks_int,
+  ra_tbl = vsearch_ra_691_clean_with_blanks,
+  metadata = metadata,
+  pcr_keep = 25,
+  title_base = "PCR 25 clean",
+  external_specs = external_specs_source,
+  ptw_ptraps = c(1, 2, 3),
+  include_prev_ptw = TRUE,
+  summary_fun = "median",
+  min_prevalence = 0.05,
+  min_mean_abundance = 1e-4,
+  blank_patterns = c("^blank", "water_blank"),
+  n_boot_ci = n_boot_nested_ci,
+  seed_boot_ci = 1001
+)
+
+source_suite_35_all <- run_source_suite_with_sensitivity(
+  clr_tbl = vsearch_clr_692_clean_with_blanks_int,
+  ra_tbl = vsearch_ra_692_clean_with_blanks,
+  metadata = metadata,
+  pcr_keep = 35,
+  title_base = "PCR 35 clean",
+  external_specs = external_specs_source,
+  ptw_ptraps = c(1, 2, 3),
+  include_prev_ptw = TRUE,
+  summary_fun = "median",
+  min_prevalence = 0.05,
+  min_mean_abundance = 1e-4,
+  blank_patterns = c("^blank", "water_blank"),
+  n_boot_ci = n_boot_nested_ci,
+  seed_boot_ci = 2001
+)
+
+source_suite_35_hc <- run_source_suite_with_sensitivity(
+  clr_tbl = vsearch_clr_692_clean_hc_with_blanks_int,
+  ra_tbl = vsearch_ra_692_clean_hc_with_blanks_int,
+  metadata = sample_qc_35,
+  pcr_keep = 35,
+  title_base = "PCR 35 high-confidence",
+  external_specs = external_specs_source,
+  ptw_ptraps = c(1, 2, 3),
+  include_prev_ptw = TRUE,
+  summary_fun = "median",
+  min_prevalence = 0.05,
+  min_mean_abundance = 1e-4,
+  blank_patterns = c("^blank", "water_blank"),
+  n_boot_ci = n_boot_nested_ci,
+  seed_boot_ci = 3001
+)
+
+res_cmp_25_clr <- source_suite_25$comparison$prev_day
+res_cmp_35_clr <- source_suite_35_all$comparison$prev_day
+res_cmp_35_hc_clr <- source_suite_35_hc$comparison$prev_day
+
+source_sensitivity_compare_35 <- dplyr::bind_rows(
+  source_suite_35_all$sensitivity_overall %>% dplyr::mutate(dataset = "35_all"),
+  source_suite_35_hc$sensitivity_overall %>% dplyr::mutate(dataset = "35_hc")
+)
+
+source_phase_sensitivity_compare_35 <- dplyr::bind_rows(
+  source_suite_35_all$sensitivity_by_phase %>% dplyr::mutate(dataset = "35_all"),
+  source_suite_35_hc$sensitivity_by_phase %>% dplyr::mutate(dataset = "35_hc")
+)
+
+source_grouped_support_compare_35 <- dplyr::bind_rows(
+  source_suite_35_all$support_overall %>% dplyr::mutate(dataset = "35_all"),
+  source_suite_35_hc$support_overall %>% dplyr::mutate(dataset = "35_hc")
+)
+
+source_grouped_support_phase_compare_35 <- dplyr::bind_rows(
+  source_suite_35_all$support_by_phase %>% dplyr::mutate(dataset = "35_all"),
+  source_suite_35_hc$support_by_phase %>% dplyr::mutate(dataset = "35_hc")
+)
+
+source_delta_ci_compare_35_overall <- dplyr::bind_rows(
+  source_suite_35_all$delta_ci_overall %>% dplyr::mutate(dataset = "35_all"),
+  source_suite_35_hc$delta_ci_overall %>% dplyr::mutate(dataset = "35_hc")
+)
+
+source_delta_ci_compare_35_by_phase <- dplyr::bind_rows(
+  source_suite_35_all$delta_ci_by_phase %>% dplyr::mutate(dataset = "35_all"),
+  source_suite_35_hc$delta_ci_by_phase %>% dplyr::mutate(dataset = "35_hc")
+)
+
+source_compare_35_overall <- dplyr::bind_rows(
+  res_cmp_35_clr$overall_summary %>% dplyr::mutate(dataset = "35_all"),
+  res_cmp_35_hc_clr$overall_summary %>% dplyr::mutate(dataset = "35_hc")
+)
+
+source_compare_35_phase <- dplyr::bind_rows(
+  res_cmp_35_clr$phase_summary %>% dplyr::mutate(dataset = "35_all"),
+  res_cmp_35_hc_clr$phase_summary %>% dplyr::mutate(dataset = "35_hc")
+)
+
+source_compare_35_ptrap <- dplyr::bind_rows(
+  res_cmp_35_clr$ptrap_summary %>% dplyr::mutate(dataset = "35_all"),
+  res_cmp_35_hc_clr$ptrap_summary %>% dplyr::mutate(dataset = "35_hc")
+)
+
+source_compare_35_delta <- compare_numeric_summaries(
+  all_tbl = res_cmp_35_clr$phase_summary,
+  hc_tbl = res_cmp_35_hc_clr$phase_summary,
+  key_cols = c("phase")
+)
+```
+
+```{r}
+res_taxon_25_clr <- run_early_late_taxon_attribution_clr(
+  clr_tbl = vsearch_clr_691_clean_with_blanks_int,
+  ra_tbl = vsearch_ra_691_clean_with_blanks,
+  metadata = metadata,
+  pcr_keep = 25,
+  ptw_ptraps = c(1, 2, 3),
+  include_prev_ptw = TRUE,
+  summary_fun = "median",
+  min_prevalence = 0.05,
+  min_mean_abundance = 1e-4,
+  blank_patterns = c("^blank", "water_blank"),
+  keep_phases = c("early", "late"),
+  external_window_days = 1L,
+  lambda_ridge = 0.01
+)
+
+res_taxon_35_hc_clr <- run_early_late_taxon_attribution_clr(
+  clr_tbl = vsearch_clr_692_clean_hc_with_blanks_int,
+  ra_tbl = vsearch_ra_692_clean_hc_with_blanks_int,
+  metadata = sample_qc_35,
+  pcr_keep = 35,
+  ptw_ptraps = c(1, 2, 3),
+  include_prev_ptw = TRUE,
+  summary_fun = "median",
+  min_prevalence = 0.05,
+  min_mean_abundance = 1e-4,
+  blank_patterns = c("^blank", "water_blank"),
+  keep_phases = c("early", "late"),
+  external_window_days = 1L,
+  lambda_ridge = 0.01
+)
+```
+
+
+# save lean source-support results for plotting
+
+```{r}
+source_comparison_tables_25 <- lapply(
+  source_suite_25$comparison,
+  function(x) x$comparison_tbl
+)
+source_comparison_tables_35_hc <- lapply(
+  source_suite_35_hc$comparison,
+  function(x) x$comparison_tbl
+)
+
+res_cmp_25_overall_summary <- res_cmp_25_clr$overall_summary
+res_cmp_35_overall_summary <- res_cmp_35_clr$overall_summary
+res_cmp_35_hc_overall_summary <- res_cmp_35_hc_clr$overall_summary
+
+delta_25 <- res_cmp_25_clr$comparison_tbl %>%
+  select(Sample.Name, ptrap, date, phase, delta_ext_over_blank, delta_lag_over_blank) %>%
+  pivot_longer(
+    cols = c(delta_ext_over_blank, delta_lag_over_blank),
+    names_to = "contrast",
+    values_to = "delta_r2"
+  ) %>%
+  mutate(
+    phase = factor(phase, levels = c("early", "mid", "late")),
+    contrast = recode(
+      contrast,
+      delta_ext_over_blank = "External over blank",
+      delta_lag_over_blank = "Lag over blank"
+    ),
+    dataset = "25-cycle"
+  ) %>%
+  select(dataset, phase, contrast, delta_r2)
+
+res_taxon_25_feature_level <- res_taxon_25_clr$feature_level_tbl
+res_taxon_35_hc_feature_level <- res_taxon_35_hc_clr$feature_level_tbl
+
+part2_result_names <- c(
+  "source_comparison_tables_25", "source_comparison_tables_35_hc",
+  "res_cmp_25_overall_summary", "res_cmp_35_overall_summary",
+  "res_cmp_35_hc_overall_summary", "delta_25",
+  "source_sensitivity_compare_35",
+  "source_phase_sensitivity_compare_35",
+  "source_grouped_support_compare_35",
+  "source_grouped_support_phase_compare_35",
+  "source_delta_ci_compare_35_overall",
+  "source_delta_ci_compare_35_by_phase",
+  "source_compare_35_overall",
+  "source_compare_35_phase",
+  "source_compare_35_ptrap",
+  "source_compare_35_delta",
+  "res_taxon_25_feature_level",
+  "res_taxon_35_hc_feature_level"
+)
+
+missing_part2 <- setdiff(part2_result_names, ls())
+if (length(missing_part2) > 0) {
+  stop("Cannot create part 2 cache; missing: ", paste(missing_part2, collapse = ", "))
+}
+part2_source_results <- mget(part2_result_names, inherits = FALSE)
+saveRDS(part2_source_results, part2_results_file, compress = "gzip")
+
+message("Saved part 2 source-support results to: ", part2_results_file)
+```

@@ -1,0 +1,1820 @@
+---
+title: "PacBio full-length 16S analysis (first part)"
+output: html_document
+date: "2026-03-27"
+---
+
+```{r setup, message=FALSE, warning=FALSE}
+suppressPackageStartupMessages({
+  library(ggplot2)
+  library(tidyr)
+  library(dplyr)
+  library(vroom)
+  library(stringr)
+  library(vegan)
+  library(patchwork)
+  library(tibble)
+  library(decontam)
+  library(phyloseq)
+})
+
+theme_set(theme_bw())
+options(stringsAsFactors = FALSE)
+```
+
+## 0) Setup and filtered data objects
+
+### 0.1 Paths and IDs
+
+```{r paths}
+code_dir <- normalizePath(getwd(), mustWork = TRUE)
+workspace_dir <- normalizePath(file.path(code_dir, ".."), mustWork = TRUE)
+data_dir <- path.expand(Sys.getenv(
+  "PTRAP_DATA_DIR",
+  unset = file.path("~", "projects", "p-trap_control", "HiFi_16S")
+))
+cache_dir <- path.expand(Sys.getenv(
+  "PTRAP_CACHE_DIR",
+  unset = file.path(workspace_dir, "cache")
+))
+output_root <- path.expand(Sys.getenv("PTRAP_OUTPUT_DIR", unset = code_dir))
+
+file_691     <- file.path(data_dir, "vsearch_merged_freq_tax_691.tsv")
+file_692     <- file.path(data_dir, "vsearch_merged_freq_tax_692.tsv")
+metadata_dir <- file.path(data_dir, "metadata.csv")
+
+stopifnot(file.exists(file_691), file.exists(file_692), file.exists(metadata_dir))
+
+id_cols <- c("Sequence", "Taxon", "id", "Consensus")
+
+dir.create(cache_dir, recursive = TRUE, showWarnings = FALSE)
+part1_cache_file <- file.path(cache_dir, "part1_pre_prediction_cache.rds")
+```
+
+### 0.2 Helper functions
+
+```{r helpers}
+read_vsearch_tbl <- function(path, id_cols = c("Sequence","Taxon","id","Consensus"),
+                             drop_first_row = TRUE) {
+  df <- data.frame(vroom(path, delim = "\t"))
+  if (drop_first_row) df <- df[-1, , drop = FALSE]
+  count_cols <- setdiff(colnames(df), id_cols)
+  df[count_cols] <- lapply(df[count_cols], as.numeric)
+  df
+}
+
+add_row_sum <- function(df, id_cols = c("Sequence","Taxon","id","Consensus"),
+                        sum_name = "sum") {
+  count_cols <- setdiff(colnames(df), c(id_cols, sum_name))
+  df[[sum_name]] <- rowSums(df[count_cols], na.rm = TRUE)
+  df
+}
+
+filter_by_total <- function(df, min_sum = 20,
+                            id_cols = c("Sequence","Taxon","id","Consensus"),
+                            sum_name = "sum") {
+  if (!sum_name %in% colnames(df)) {
+    df <- add_row_sum(df, id_cols = id_cols, sum_name = sum_name)
+  }
+  df %>% filter(.data[[sum_name]] > min_sum)
+}
+
+to_relative_abundance <- function(df, id_cols = c("Sequence","Taxon","id","Consensus")) {
+  count_cols <- setdiff(colnames(df), id_cols)
+  counts <- df[count_cols]
+  col_totals <- colSums(counts, na.rm = TRUE)
+  col_totals[col_totals == 0] <- NA_real_
+  ra <- sweep(counts, 2, col_totals, FUN = "/")
+  ra[is.na(ra)] <- 0
+  data.frame(df[id_cols], ra, check.names = FALSE)
+}
+
+to_clr <- function(ra_df,
+                        id_cols = c("Sequence","Taxon","id","Consensus"),
+                        pseudo = NULL) {
+  count_cols <- setdiff(colnames(ra_df), id_cols)
+  
+  mat <- as.matrix(ra_df[, count_cols, drop = FALSE])
+  storage.mode(mat) <- "double"
+  mat[is.na(mat)] <- 0
+  
+  if (is.null(pseudo)) {
+    min_pos <- suppressWarnings(min(mat[mat > 0], na.rm = TRUE))
+    pseudo <- if (is.finite(min_pos)) min_pos / 2 else 1e-6
+  }
+  
+  mat[mat == 0] <- pseudo
+  log_mat <- log(mat)
+  clr_mat <- sweep(log_mat, 2, colMeans(log_mat), FUN = "-")
+  
+  cbind(
+    ra_df[, id_cols, drop = FALSE],
+    as.data.frame(clr_mat, check.names = FALSE)
+  )
+}
+
+alpha_div_table <- function(ra_df, meta_sub,
+                            id_cols = c("Sequence","Taxon","id","Consensus"),
+                            ptrap_label_prefix = "p-trap ") {
+  sample_names <- meta_sub$Sample.Name
+  sample_names <- sample_names[sample_names %in% colnames(ra_df)]
+
+  ra_sub <- ra_df %>% select(any_of(c(id_cols, sample_names)))
+  mat <- as.matrix(ra_sub %>% select(-all_of(id_cols)))
+
+  meta_sub %>%
+    mutate(
+      ptrap_label = paste0(ptrap_label_prefix, ptrap),
+      shannon = diversity(mat, MARGIN = 2, index = "shannon"),
+      simpson = diversity(mat, MARGIN = 2, index = "simpson")
+    )
+}
+
+plot_alpha_ts <- function(div_tbl, metric = c("shannon", "simpson"), title = NULL) {
+  metric <- match.arg(metric)
+  ylab <- ifelse(metric == "shannon", "Shannon diversity", "Simpson diversity")
+  if (is.null(title)) title <- ylab
+
+  ggplot(div_tbl, aes(x = date, y = .data[[metric]], color = factor(ptrap), group = ptrap)) +
+    geom_line(linewidth = 0.7) +
+    geom_point(size = 1.6) +
+    scale_x_date(date_breaks = "1 week", date_labels = "%b-%d") +
+    labs(x = "Date", y = ylab, color = "P-trap", title = title) +
+    theme_bw() +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
+}
+
+get_sample_depth <- function(df, id_cols = c("Sequence","Taxon","id","Consensus")) {
+  sample_cols <- setdiff(colnames(df), c(id_cols, "sum"))
+  tibble(
+    Sample.Name = sample_cols,
+    total_counts = colSums(df[, sample_cols, drop = FALSE], na.rm = TRUE)
+  ) %>%
+    arrange(total_counts)
+}
+
+run_asv_time_models <- function(ptrap_clr_df, metadata,
+                                     id_col = "id",
+                                     ptraps_keep = c(1, 3),
+                                     phenotype_keep = "PTW") {
+  meta_use <- metadata %>%
+    dplyr::mutate(
+      doy = lubridate::yday(date),
+      ptrap = factor(ptrap)
+    ) %>%
+    dplyr::filter(
+      Phenotype == phenotype_keep,
+      ptrap %in% ptraps_keep
+    )
+
+  sample_cols <- intersect(
+    meta_use$Sample.Name,
+    setdiff(colnames(ptrap_clr_df), c("Sequence", "Taxon", "Consensus", id_col))
+  )
+
+  meta_use <- meta_use %>%
+    dplyr::filter(Sample.Name %in% sample_cols) %>%
+    dplyr::arrange(match(Sample.Name, sample_cols))
+
+  res_list <- lapply(seq_len(nrow(ptrap_clr_df)), function(i) {
+    df_i <- meta_use
+    df_i$clr <- as.numeric(ptrap_clr_df[i, sample_cols, drop = TRUE])
+
+    fit <- tryCatch(
+      stats::lm(clr ~ doy + ptrap, data = df_i),
+      error = function(e) NULL
+    )
+
+    if (is.null(fit)) {
+      return(tibble::tibble(
+        id = ptrap_clr_df[[id_col]][i],
+        estimate = NA_real_,
+        std.error = NA_real_,
+        statistic = NA_real_,
+        p.value = NA_real_
+      ))
+    }
+
+    broom::tidy(fit) %>%
+      dplyr::filter(term == "doy") %>%
+      dplyr::transmute(
+        id = ptrap_clr_df[[id_col]][i],
+        estimate,
+        std.error,
+        statistic,
+        p.value
+      )
+  })
+
+  dplyr::bind_rows(res_list)
+}
+
+pca_var_explained <- function(pca_fit, n = 5) {
+  s2 <- pca_fit$sdev^2
+  round(100 * s2[seq_len(min(n, length(s2)))] / sum(s2), 1)
+}
+
+`%||%` <- function(x, y) if (is.null(x)) y else x
+```
+
+### 0.3 Load module file
+
+```{r source_module}
+module_path_candidates <- c(
+  "longitudinal_pca_functions.R",
+  file.path(data_dir, "longitudinal_pca_functions.R")
+)
+module_path <- module_path_candidates[file.exists(module_path_candidates)][1]
+stopifnot(!is.na(module_path), file.exists(module_path))
+source(module_path)
+```
+
+### 0.4 Load counts, metadata, and build filtered main objects
+
+```{r load_and_filter}
+min_sum <- 20
+
+vsearch_freq_691_main <- read_vsearch_tbl(file_691, id_cols = id_cols, drop_first_row = TRUE) %>%
+  add_row_sum(id_cols = id_cols, sum_name = "sum") %>%
+  filter_by_total(min_sum = min_sum, id_cols = id_cols, sum_name = "sum")
+
+vsearch_freq_692_main <- read_vsearch_tbl(file_692, id_cols = id_cols, drop_first_row = TRUE) %>%
+  add_row_sum(id_cols = id_cols, sum_name = "sum") %>%
+  filter_by_total(min_sum = min_sum, id_cols = id_cols, sum_name = "sum")
+
+metadata <- data.frame(vroom(metadata_dir, delim = ","))
+metadata$Sample.Name <- gsub("-", ".", metadata$Sample.Name)
+metadata$Phenotype <- as.factor(metadata$Phenotype)
+
+metadata <- metadata %>%
+  mutate(
+    date  = str_extract(Sample.Name, "\\d{8}"),
+    label = str_extract(Sample.Name, "[APB][1-3]|[AP]a"),
+    sampling_time = str_sub(label, 1, 1),
+    ptrap = str_sub(label, 2, 2),
+    ptrap = factor(ptrap, levels = c("1", "2", "3", "a")),
+    date = as.Date(date, format = "%Y%m%d")
+  )
+
+metadata <- metadata %>%
+  mutate(
+    Phenotype = case_when(
+      Phenotype %in% c("B1", "B2", "B3", "BW") ~ "TW",
+      Phenotype %in% c("blank", "negative control", "positive control", "water") ~ "control/blank",
+      TRUE ~ as.character(Phenotype)
+    ),
+    Phenotype = as.factor(Phenotype)
+  )
+
+date_key <- tibble::tribble(
+  ~date,         ~resting_time, ~week, ~dow,
+  as.Date("2024-05-07"), NA,     1.5,   1,
+  as.Date("2024-05-08"), 12,     1.5,   2,
+  as.Date("2024-05-09"), 12,     1.5,   3,
+  as.Date("2024-05-10"), 12,     1.5,   4,
+  as.Date("2024-05-11"), 12,     1.5,   5,
+  as.Date("2024-05-12"), 12,     1.5,   6,
+  as.Date("2024-05-13"), 12,     1.5,   7,
+  as.Date("2024-05-14"), 12,     1.5,   8,
+  as.Date("2024-05-15"), 12,     1.5,   9,
+  as.Date("2024-05-16"), 16,     1.5,   10,
+  as.Date("2024-05-17"), 16,     1.5,   11,
+  as.Date("2024-05-20"), 64,       3,   1,
+  as.Date("2024-05-21"), 16,       3,   2,
+  as.Date("2024-05-22"), 16,       3,   3,
+  as.Date("2024-05-23"), 16,       3,   4,
+  as.Date("2024-05-24"), 16,       3,   5,
+  as.Date("2024-05-28"), 88,       4,   1,
+  as.Date("2024-05-29"), 16,       4,   2,
+  as.Date("2024-05-30"), 16,       4,   3,
+  as.Date("2024-06-03"), 88,       5,   1,
+  as.Date("2024-06-04"), 16,       5,   2,
+  as.Date("2024-06-05"), 16,       5,   3,
+  as.Date("2024-06-06"), 16,       5,   4,
+  as.Date("2024-06-07"), 16,       5,   5,
+  as.Date("2024-06-10"), 64,       6,   1,
+  as.Date("2024-06-11"), 16,       6,   2,
+  as.Date("2024-06-12"), 16,       6,   3,
+  as.Date("2024-06-13"), 16,       6,   4,
+  as.Date("2024-06-14"), 16,       6,   5,
+  as.Date("2024-06-17"), 64,       7,   1,
+  as.Date("2024-06-18"), 16,       7,   2,
+  as.Date("2024-06-21"), 64,       7,   5,
+  as.Date("2024-06-24"), 64,       8,   1,
+  as.Date("2024-06-25"), 16,       8,   2,
+  as.Date("2024-06-26"), 16,       8,   3,
+  as.Date("2024-06-27"), 16,       8,   4,
+  as.Date("2024-06-30"), 64,       9,   1,
+  as.Date("2024-07-01"), 16,       9,   2,
+  as.Date("2024-07-02"), 16,       9,   3,
+  as.Date("2024-07-03"), 16,       9,   4,
+  as.Date("2024-07-05"), 40,       9,   6,
+  as.Date("2024-07-08"), 64,      10,   1,
+  as.Date("2024-07-09"), 16,      10,   2,
+  as.Date("2024-07-10"), 16,      10,   3,
+  as.Date("2024-07-11"), 16,      10,   4,
+  as.Date("2024-07-15"), 88,      11,   1,
+  as.Date("2024-07-16"), 16,      11,   2,
+  as.Date("2024-07-17"), 16,      11,   3,
+  as.Date("2024-07-18"), 16,      11,   4,
+  as.Date("2024-07-19"), 16,      11,   5,
+  as.Date("2024-07-22"), 72,      12,   1,
+  as.Date("2024-07-23"), 24,      12,   2,
+  as.Date("2024-07-24"), 24,      12,   3,
+  as.Date("2024-07-25"), 24,      12,   4,
+  as.Date("2024-07-28"), 72,      13,   1,
+  as.Date("2024-07-29"), 24,      13,   2,
+  as.Date("2024-07-30"), 24,      13,   3,
+  as.Date("2024-07-31"), 36,      13,   4,
+  as.Date("2024-08-01"), 24,      13,   5,
+  as.Date("2024-08-02"), 24,      13,   6,
+  as.Date("2024-08-05"), 60,      14,   1,
+  as.Date("2024-08-06"), 36,      14,   2,
+  as.Date("2024-08-07"), 24,      14,   3,
+  as.Date("2024-08-09"), 36,      14,   NA
+)
+
+ampm_key <- tibble::tribble(
+  ~Sample.Name,                    ~resting_time, ~dow,
+  "PTW_11am3_20240809",            0,             NA,
+  "PTW_5pm2_20240809",             6,             NA,
+  "PTW_1pm2_20240809",             2,             NA,
+  "PTW_1pm1_20240809",             2,             NA,
+  "PTW_1pm3_20240809",             2,             NA,
+  "PTW_5pm1_20240809",             6,             NA,
+  "PTW_11pm1_20240809",           12,             NA,
+  "PTW_5pm3_20240809",             6,             NA,
+  "PTW_11am1_20240809",            0,             NA,
+  "PTW_11am2_20240809",            0,             NA
+)
+
+metadata <- metadata %>%
+  left_join(date_key, by = "date") %>%
+  left_join(ampm_key, by = "Sample.Name", suffix = c("", "_ampm")) %>%
+  mutate(
+    resting_time = coalesce(resting_time_ampm, resting_time),
+    dow = coalesce(dow_ampm, dow)
+  ) %>%
+  select(-resting_time_ampm, -dow_ampm)
+
+# 35-cycle objects are rebuilt below after blank-aware filtering and decontam.
+```
+
+```{r}
+DNA_concentration <- data.frame(vroom(file.path(data_dir, "DNA_concentration.csv"), delim = ","))
+volume_metadata <- data.frame(vroom(file.path(data_dir, "volume_metadata.csv"), delim = ","))
+DNA_concentration_combined <- left_join(DNA_concentration, volume_metadata, by = "Sample_ID")
+DNA_concentration_combined$date <- as.Date(as.character(DNA_concentration_combined$date), format = "%Y%m%d")
+DNA_concentration_combined$`DNA.ng.uL.` <- as.numeric(DNA_concentration_combined$`DNA.ng.uL.`)
+DNA_concentration_combined_final <- DNA_concentration_combined %>%
+  mutate(
+    ptrap_code = str_extract(Sample_ID, "(?<=_)[AP][123](?=_)"),
+    p_trap = as.integer(str_extract(ptrap_code, "\\d")),
+    `DNA.ng.uL.` = replace_na(`DNA.ng.uL.`, 0),
+    total_DNA_ng = as.numeric(DNA.ng.uL.) * 25,
+    DNA_ng_per_mL = total_DNA_ng / `volume.mL.`
+  )
+ptrap_dna <- DNA_concentration_combined_final %>%
+  filter(
+    sample_type == "p-trap",
+    p_trap %in% c(1, 2, 3)
+  ) %>%
+  arrange(p_trap, date) %>%
+  select(
+    Sample_ID,
+    p_trap,
+    date,
+    flushing_type,
+    resting_time.h.,
+    volume.mL.,
+    total_DNA_ng,
+    DNA_ng_per_mL
+  )
+```
+
+```{r fig.height=6, fig.width=15}
+ptrap_dna_plot <- ptrap_dna %>%
+  mutate(
+    p_trap_label = factor(
+      p_trap,
+      levels = c(1, 3, 2),
+      labels = c(
+        "Handwashing p-trap 1",
+        "Handwashing p-trap 2",
+        "Tap water p-trap"
+      )
+    )
+  )
+
+ggplot(
+  ptrap_dna_plot,
+  aes(
+    x = date,
+    y = DNA_ng_per_mL,
+    color = p_trap_label,
+    group = p_trap_label
+  )
+) +
+  geom_line(linewidth = 0.8, alpha = 0.8) +
+  geom_point(size = 2.5, alpha = 0.55) +
+  labs(
+    x = "Date",
+    y = "DNA concentration in original sample (ng/mL)",
+    color = "P-trap"
+  ) +
+  theme_classic()
+```
+
+
+
+
+```{r}
+# ============================================================
+# 0.5 Blank aware qc for 25 cycle batch using decontam
+# ============================================================
+meta_25_all <- metadata %>%
+  filter(PCR.cycles == 25) %>%
+  arrange(Sample.Name) %>%
+  mutate(
+    is_decontam_neg = grepl("PCRneg|blank", Sample.Name, ignore.case = TRUE),
+    is_nonbiol_control =
+      grepl("^PCRneg", Sample.Name, ignore.case = TRUE) |
+      grepl("blank", Sample.Name, ignore.case = TRUE) |
+      toupper(as.character(Phenotype)) %in% c("CONTROL/BLANK", "BLANK", "NEG", "NTC", "NEGATIVE")
+  )
+
+meta_25_all %>% count(is_decontam_neg)
+meta_25_all %>% count(is_nonbiol_control)
+
+meta_25_all %>%
+  filter(is_decontam_neg | is_nonbiol_control) %>%
+  select(Sample.Name, Phenotype, label, ptrap, is_decontam_neg, is_nonbiol_control)
+
+# ------------------------------------------------------------
+# 1) Use the 25-cycle count table AFTER light prefilter
+# ------------------------------------------------------------
+count_25_tbl <- vsearch_freq_691_main
+
+sample_cols_25 <- intersect(meta_25_all$Sample.Name, colnames(count_25_tbl))
+
+meta_25_dc <- meta_25_all %>%
+  filter(Sample.Name %in% sample_cols_25) %>%
+  arrange(match(Sample.Name, sample_cols_25))
+
+stopifnot(any(meta_25_dc$is_decontam_neg))
+
+sample_depth_25_raw <- get_sample_depth(count_25_tbl, id_cols = id_cols) %>%
+  rename(total_reads_raw = total_counts)
+
+sample_qc_25_raw <- meta_25_dc %>%
+  left_join(sample_depth_25_raw, by = "Sample.Name") %>%
+  arrange(total_reads_raw)
+
+sample_qc_25_raw %>%
+  select(Sample.Name, Phenotype, ptrap, is_decontam_neg, is_nonbiol_control, total_reads_raw) %>%
+  tibble::as_tibble() %>%
+  print(n = 100)
+
+# ------------------------------------------------------------
+# 2) Build phyloseq object for decontam
+#    Use biological samples + PCR negatives only
+# ------------------------------------------------------------
+meta_25_for_decontam <- meta_25_dc %>%
+  filter(!is_nonbiol_control | is_decontam_neg)
+
+otu_mat_25 <- as.matrix(count_25_tbl[, meta_25_for_decontam$Sample.Name, drop = FALSE])
+storage.mode(otu_mat_25) <- "numeric"
+rownames(otu_mat_25) <- count_25_tbl[[id_cols[1]]]
+
+sdat_25 <- meta_25_for_decontam %>% as.data.frame()
+rownames(sdat_25) <- sdat_25$Sample.Name
+
+ps_25 <- phyloseq(
+  otu_table(otu_mat_25, taxa_are_rows = TRUE),
+  sample_data(sdat_25)
+)
+
+# ------------------------------------------------------------
+# 3) Run decontam at multiple thresholds
+# ------------------------------------------------------------
+contam_prev_25_01 <- isContaminant(
+  ps_25,
+  method = "prevalence",
+  neg = "is_decontam_neg",
+  threshold = 0.1
+)
+
+contam_prev_25_05 <- isContaminant(
+  ps_25,
+  method = "prevalence",
+  neg = "is_decontam_neg",
+  threshold = 0.5
+)
+
+contam_prev_25_07 <- isContaminant(
+  ps_25,
+  method = "prevalence",
+  neg = "is_decontam_neg",
+  threshold = 0.7
+)
+
+table(contam_prev_25_01$contaminant)
+table(contam_prev_25_05$contaminant)
+table(contam_prev_25_07$contaminant)
+
+# ------------------------------------------------------------
+# 4) Compare contaminant calls
+#    Default downstream choice = 0.5
+# ------------------------------------------------------------
+contam_tbl_25 <- count_25_tbl %>%
+  select(any_of(c(id_cols, "Taxon", "Consensus"))) %>%
+  mutate(
+    contaminant_01 = contam_prev_25_01$contaminant[match(.data[[id_cols[1]]], rownames(contam_prev_25_01))],
+    contaminant_05 = contam_prev_25_05$contaminant[match(.data[[id_cols[1]]], rownames(contam_prev_25_05))],
+    contaminant_07 = contam_prev_25_07$contaminant[match(.data[[id_cols[1]]], rownames(contam_prev_25_07))]
+  )
+
+contam_tbl_25 %>%
+  count(contaminant_01, contaminant_05, contaminant_07)
+
+decontam_threshold_used_25 <- 0.5
+chosen_contam_25 <- contam_prev_25_05
+
+keep_asv_25 <- rownames(chosen_contam_25)[!chosen_contam_25$contaminant]
+removed_asv_25 <- rownames(chosen_contam_25)[chosen_contam_25$contaminant]
+
+cat("Chosen 25-cycle decontam threshold =", decontam_threshold_used_25, "\n")
+cat("25-cycle ASVs kept =", length(keep_asv_25), "\n")
+cat("25-cycle ASVs removed =", length(removed_asv_25), "\n")
+
+asv_removed_tbl_25 <- count_25_tbl %>%
+  select(any_of(c(id_cols, "Taxon", "Consensus"))) %>%
+  filter(.data[[id_cols[1]]] %in% removed_asv_25)
+
+asv_removed_tbl_25 %>% tibble::as_tibble() %>% print(n = 100)
+
+# ------------------------------------------------------------
+# 5) Remove contaminant ASVs; keep all real samples for now
+# ------------------------------------------------------------
+count_25_decontam <- count_25_tbl %>%
+  filter(.data[[id_cols[1]]] %in% keep_asv_25)
+
+sample_depth_25_clean <- get_sample_depth(count_25_decontam, id_cols = id_cols) %>%
+  rename(total_reads_clean = total_counts)
+
+# ------------------------------------------------------------
+# 6) Build sample-level flags (do NOT hard delete)
+# ------------------------------------------------------------
+neg_stats_25_clean <- meta_25_for_decontam %>%
+  filter(is_decontam_neg) %>%
+  left_join(sample_depth_25_clean, by = "Sample.Name") %>%
+  summarise(
+    n_neg = n(),
+    neg_min_clean = min(total_reads_clean, na.rm = TRUE),
+    neg_median_clean = median(total_reads_clean, na.rm = TRUE),
+    neg_mean_clean = mean(total_reads_clean, na.rm = TRUE),
+    neg_max_clean = max(total_reads_clean, na.rm = TRUE)
+  )
+
+neg_stats_25_clean
+
+sample_qc_25 <- meta_25_dc %>%
+  left_join(sample_depth_25_raw, by = "Sample.Name") %>%
+  left_join(sample_depth_25_clean, by = "Sample.Name") %>%
+  mutate(
+    frac_retained = total_reads_clean / total_reads_raw,
+    clean_vs_neg_median = total_reads_clean / neg_stats_25_clean$neg_median_clean,
+    clean_vs_neg_max = total_reads_clean / neg_stats_25_clean$neg_max_clean
+  ) %>%
+  mutate(
+    flag_below_neg_median = !is_nonbiol_control & total_reads_clean < neg_stats_25_clean$neg_median_clean,
+    flag_low_retained = !is_nonbiol_control & frac_retained < 0.25,
+    flag_very_low_clean = !is_nonbiol_control & total_reads_clean < 1000,
+    flag_any = flag_below_neg_median | flag_low_retained | flag_very_low_clean,
+    confidence_class = case_when(
+      is_nonbiol_control ~ "control",
+      flag_any ~ "low_confidence",
+      TRUE ~ "high_confidence"
+    )
+  ) %>%
+  arrange(total_reads_clean)
+
+sample_qc_25 %>% count(confidence_class)
+
+sample_qc_25 %>%
+  filter(!is_nonbiol_control) %>%
+  select(
+    Sample.Name, Phenotype, ptrap,
+    total_reads_raw, total_reads_clean, frac_retained,
+    clean_vs_neg_median, clean_vs_neg_max,
+    flag_below_neg_median, flag_low_retained, flag_very_low_clean,
+    confidence_class
+  ) %>%
+  tibble::as_tibble() %>%
+  print(n = 100)
+
+removed_samples_25 <- sample_qc_25 %>%
+  filter(!is_nonbiol_control, confidence_class == "low_confidence") %>%
+  select(
+    Sample.Name, Phenotype, ptrap,
+    total_reads_raw, total_reads_clean, frac_retained,
+    clean_vs_neg_median, clean_vs_neg_max,
+    flag_below_neg_median, flag_low_retained, flag_very_low_clean,
+    confidence_class
+  ) %>%
+  arrange(total_reads_clean)
+
+removed_samples_25 %>% tibble::as_tibble() %>% print(n = 100)
+
+# ------------------------------------------------------------
+# 7) Build downstream clean tables
+#    A) all real samples after decontam
+#    B) high-confidence subset after decontam
+# ------------------------------------------------------------
+keep_real_samples_25_all <- sample_qc_25 %>%
+  filter(!is_nonbiol_control) %>%
+  pull(Sample.Name)
+
+meta_25_clean <- sample_qc_25 %>%
+  filter(!is_nonbiol_control) %>%
+  arrange(date)
+
+count_25_clean <- count_25_decontam %>%
+  select(any_of(c(id_cols, keep_real_samples_25_all)))
+
+vsearch_ra_691_clean <- to_relative_abundance(count_25_clean, id_cols = id_cols)
+
+sample_qc_25 <- sample_qc_25 %>%
+  mutate(
+    is_nonpcr_blank = is_nonbiol_control & !is_decontam_neg
+  )
+
+keep_samples_25_with_blanks <- sample_qc_25 %>%
+  filter(!is_decontam_neg) %>%
+  pull(Sample.Name)
+
+count_25_clean_with_blanks <- count_25_decontam %>%
+  select(any_of(c(id_cols, keep_samples_25_with_blanks)))
+
+vsearch_ra_691_clean_with_blanks <- to_relative_abundance(
+  count_25_clean_with_blanks,
+  id_cols = id_cols
+)
+
+meta_25_ptrap <- meta_25_clean %>%
+  filter(Phenotype == "PTW", ptrap %in% c(1, 2, 3)) %>%
+  filter(!grepl("_re2$", Sample.Name)) %>%
+  arrange(date)
+
+ra_25_ptrap <- vsearch_ra_691_clean %>%
+  select(any_of(c(id_cols, meta_25_ptrap$Sample.Name)))
+
+clr_25_ptrap <- to_clr(ra_25_ptrap, id_cols = id_cols)
+
+cat("Final real 25-cycle samples kept (all clean) =", nrow(meta_25_clean), "\n")
+cat("Final PTW p-trap 25-cycle samples kept (all clean) =", nrow(meta_25_ptrap), "\n")
+cat("Final 25-cycle ASVs kept =", nrow(count_25_clean), "\n")
+```
+
+
+### 0.5 Blank aware qc for 35 cycle batch using decontam
+
+```{r}
+# ------------------------------------------------------------
+# 0) 35-cycle metadata + identify controls
+# ------------------------------------------------------------
+meta_35_all <- metadata %>%
+  filter(PCR.cycles == 35) %>%
+  arrange(Sample.Name) %>%
+  mutate(
+    is_decontam_neg = grepl("PCRneg|blank", Sample.Name, ignore.case = TRUE),
+    is_nonbiol_control =
+      grepl("^PCRneg", Sample.Name, ignore.case = TRUE) |
+      grepl("blank", Sample.Name, ignore.case = TRUE) |
+      toupper(as.character(Phenotype)) %in% c("CONTROL/BLANK", "BLANK", "NEG", "NTC", "NEGATIVE")
+  )
+
+meta_35_all %>% count(is_decontam_neg)
+meta_35_all %>% count(is_nonbiol_control)
+
+meta_35_all %>%
+  filter(is_decontam_neg | is_nonbiol_control) %>%
+  select(Sample.Name, Phenotype, label, ptrap, is_decontam_neg, is_nonbiol_control)
+
+# ------------------------------------------------------------
+# 1) Use the 35-cycle count table AFTER your light prefilter
+# ------------------------------------------------------------
+count_35_tbl <- vsearch_freq_692_main
+
+sample_cols_35 <- intersect(meta_35_all$Sample.Name, colnames(count_35_tbl))
+
+meta_35_dc <- meta_35_all %>%
+  filter(Sample.Name %in% sample_cols_35) %>%
+  arrange(match(Sample.Name, sample_cols_35))
+
+sample_depth_35_raw <- get_sample_depth(count_35_tbl, id_cols = id_cols) %>%
+  rename(total_reads_raw = total_counts)
+
+sample_qc_35_raw <- meta_35_dc %>%
+  left_join(sample_depth_35_raw, by = "Sample.Name") %>%
+  arrange(total_reads_raw)
+
+sample_qc_35_raw %>%
+  select(Sample.Name, Phenotype, ptrap, is_decontam_neg, is_nonbiol_control, total_reads_raw) %>%
+  tibble::as_tibble() %>%
+  print(n = 100)
+
+# ------------------------------------------------------------
+# 2) Build phyloseq object for decontam
+#    Use biological samples + PCR negatives only
+# ------------------------------------------------------------
+meta_35_for_decontam <- meta_35_dc %>%
+  filter(!is_nonbiol_control | is_decontam_neg)
+
+otu_mat_35 <- as.matrix(count_35_tbl[, meta_35_for_decontam$Sample.Name, drop = FALSE])
+storage.mode(otu_mat_35) <- "numeric"
+rownames(otu_mat_35) <- count_35_tbl[[id_cols[1]]]
+
+sdat_35 <- meta_35_for_decontam %>% as.data.frame()
+rownames(sdat_35) <- sdat_35$Sample.Name
+
+ps_35 <- phyloseq(
+  otu_table(otu_mat_35, taxa_are_rows = TRUE),
+  sample_data(sdat_35)
+)
+
+# ------------------------------------------------------------
+# 3) Run decontam at multiple thresholds
+# ------------------------------------------------------------
+contam_prev_01 <- isContaminant(
+  ps_35,
+  method = "prevalence",
+  neg = "is_decontam_neg",
+  threshold = 0.1
+)
+
+contam_prev_05 <- isContaminant(
+  ps_35,
+  method = "prevalence",
+  neg = "is_decontam_neg",
+  threshold = 0.5
+)
+
+contam_prev_07 <- isContaminant(
+  ps_35,
+  method = "prevalence",
+  neg = "is_decontam_neg",
+  threshold = 0.7
+)
+
+table(contam_prev_01$contaminant)
+table(contam_prev_05$contaminant)
+table(contam_prev_07$contaminant)
+
+# ------------------------------------------------------------
+# 4) Compare contaminant calls
+#    Default downstream choice = 0.5
+# ------------------------------------------------------------
+contam_tbl_35 <- count_35_tbl %>%
+  select(any_of(c(id_cols, "Taxon", "Consensus"))) %>%
+  mutate(
+    contaminant_01 = contam_prev_01$contaminant[match(.data[[id_cols[1]]], rownames(contam_prev_01))],
+    contaminant_05 = contam_prev_05$contaminant[match(.data[[id_cols[1]]], rownames(contam_prev_05))],
+    contaminant_07 = contam_prev_07$contaminant[match(.data[[id_cols[1]]], rownames(contam_prev_07))]
+  )
+
+contam_tbl_35 %>%
+  count(contaminant_01, contaminant_05, contaminant_07)
+
+decontam_threshold_used <- 0.5
+chosen_contam <- contam_prev_05
+
+keep_asv_35 <- rownames(chosen_contam)[!chosen_contam$contaminant]
+removed_asv_35 <- rownames(chosen_contam)[chosen_contam$contaminant]
+
+cat("Chosen decontam threshold =", decontam_threshold_used, "
+")
+cat("ASVs kept =", length(keep_asv_35), "
+")
+cat("ASVs removed =", length(removed_asv_35), "
+")
+
+asv_removed_tbl_35 <- count_35_tbl %>%
+  select(any_of(c(id_cols, "Taxon", "Consensus"))) %>%
+  filter(.data[[id_cols[1]]] %in% removed_asv_35)
+
+asv_removed_tbl_35 %>% tibble::as_tibble() %>% print(n = 100)
+
+# ------------------------------------------------------------
+# 5) Remove contaminant ASVs; keep all real samples for now
+# ------------------------------------------------------------
+count_35_decontam <- count_35_tbl %>%
+  filter(.data[[id_cols[1]]] %in% keep_asv_35)
+
+sample_depth_35_clean <- get_sample_depth(count_35_decontam, id_cols = id_cols) %>%
+  rename(total_reads_clean = total_counts)
+
+# ------------------------------------------------------------
+# 6) Build sample-level flags (do NOT hard delete)
+# ------------------------------------------------------------
+neg_stats_35_clean <- meta_35_for_decontam %>%
+  filter(is_decontam_neg) %>%
+  left_join(sample_depth_35_clean, by = "Sample.Name") %>%
+  summarise(
+    n_neg = n(),
+    neg_min_clean = min(total_reads_clean, na.rm = TRUE),
+    neg_median_clean = median(total_reads_clean, na.rm = TRUE),
+    neg_mean_clean = mean(total_reads_clean, na.rm = TRUE),
+    neg_max_clean = max(total_reads_clean, na.rm = TRUE)
+  )
+
+neg_stats_35_clean
+
+sample_qc_35 <- meta_35_dc %>%
+  left_join(sample_depth_35_raw, by = "Sample.Name") %>%
+  left_join(sample_depth_35_clean, by = "Sample.Name") %>%
+  mutate(
+    frac_retained = total_reads_clean / total_reads_raw,
+    clean_vs_neg_median = total_reads_clean / neg_stats_35_clean$neg_median_clean,
+    clean_vs_neg_max = total_reads_clean / neg_stats_35_clean$neg_max_clean
+  ) %>%
+  mutate(
+    flag_below_neg_median = !is_nonbiol_control & total_reads_clean < neg_stats_35_clean$neg_median_clean,
+    flag_low_retained = !is_nonbiol_control & frac_retained < 0.25,
+    flag_very_low_clean = !is_nonbiol_control & total_reads_clean < 1000,
+    flag_any = flag_below_neg_median | flag_low_retained | flag_very_low_clean,
+    confidence_class = case_when(
+      is_nonbiol_control ~ "control",
+      flag_any ~ "low_confidence",
+      TRUE ~ "high_confidence"
+    )
+  ) %>%
+  arrange(total_reads_clean)
+
+sample_qc_35 %>% count(confidence_class)
+
+sample_qc_35 %>%
+  filter(!is_nonbiol_control) %>%
+  select(
+    Sample.Name, Phenotype, ptrap,
+    total_reads_raw, total_reads_clean, frac_retained,
+    clean_vs_neg_median, clean_vs_neg_max,
+    flag_below_neg_median, flag_low_retained, flag_very_low_clean,
+    confidence_class
+  ) %>%
+  tibble::as_tibble() %>%
+  print(n = 100)
+
+removed_samples_35 <- sample_qc_35 %>%
+  filter(!is_nonbiol_control, confidence_class == "low_confidence") %>%
+  select(
+    Sample.Name, Phenotype, ptrap,
+    total_reads_raw, total_reads_clean, frac_retained,
+    clean_vs_neg_median, clean_vs_neg_max,
+    flag_below_neg_median, flag_low_retained, flag_very_low_clean,
+    confidence_class
+  ) %>%
+  arrange(total_reads_clean)
+
+removed_samples_35 %>% tibble::as_tibble() %>% print(n = 100)
+
+# ------------------------------------------------------------
+# 7) Build downstream clean tables
+#    A) all real samples after decontam
+#    B) high-confidence subset after decontam
+# ------------------------------------------------------------
+keep_real_samples_35_all <- sample_qc_35 %>%
+  filter(!is_nonbiol_control) %>%
+  pull(Sample.Name)
+
+meta_35_clean <- sample_qc_35 %>%
+  filter(!is_nonbiol_control) %>%
+  arrange(date)
+
+count_35_clean <- count_35_decontam %>%
+  select(any_of(c(id_cols, keep_real_samples_35_all)))
+
+vsearch_ra_692_clean <- to_relative_abundance(count_35_clean, id_cols = id_cols)
+
+sample_qc_35 <- sample_qc_35 %>%
+  mutate(
+    is_nonpcr_blank = is_nonbiol_control & !is_decontam_neg
+  )
+
+keep_samples_35_with_blanks <- sample_qc_35 %>%
+  filter(!is_decontam_neg) %>%   
+  pull(Sample.Name)
+
+count_35_clean_with_blanks <- count_35_decontam %>%
+  select(any_of(c(id_cols, keep_samples_35_with_blanks)))
+
+vsearch_ra_692_clean_with_blanks <- to_relative_abundance(
+  count_35_clean_with_blanks,
+  id_cols = id_cols
+)
+
+keep_real_samples_35_hc <- sample_qc_35 %>%
+  filter(!is_nonbiol_control, confidence_class == "high_confidence") %>%
+  pull(Sample.Name)
+
+meta_35_clean_hc <- sample_qc_35 %>%
+  filter(!is_nonbiol_control, confidence_class == "high_confidence") %>%
+  arrange(date)
+
+count_35_clean_hc <- count_35_decontam %>%
+  select(any_of(c(id_cols, keep_real_samples_35_hc)))
+
+vsearch_ra_692_clean_hc <- to_relative_abundance(count_35_clean_hc, id_cols = id_cols)
+
+meta_35_ptrap <- meta_35_clean %>%
+  filter(Phenotype == "PTW", ptrap %in% c(1, 2, 3)) %>%
+  filter(!grepl("_re2$", Sample.Name)) %>%
+  arrange(date)
+
+ra_35_ptrap <- vsearch_ra_692_clean %>%
+  select(any_of(c(id_cols, meta_35_ptrap$Sample.Name)))
+
+clr_35_ptrap <- to_clr(ra_35_ptrap, id_cols = id_cols)
+
+meta_35_ptrap_hc <- meta_35_clean_hc %>%
+  filter(Phenotype == "PTW", ptrap %in% c(1, 2, 3)) %>%
+  filter(!grepl("_re2$", Sample.Name)) %>%
+  arrange(date)
+
+ra_35_ptrap_hc <- vsearch_ra_692_clean_hc %>%
+  select(any_of(c(id_cols, meta_35_ptrap_hc$Sample.Name)))
+
+clr_35_ptrap_hc <- to_clr(ra_35_ptrap_hc, id_cols = id_cols)
+
+vsearch_ra_merged_clean <- full_join(
+  vsearch_ra_691_clean,
+  vsearch_ra_692_clean,
+  by = id_cols,
+  suffix = c("_691", "_692")
+) %>%
+  mutate(across(where(is.numeric), ~ replace_na(., 0)))
+
+vsearch_clr_global_clean <- to_clr(vsearch_ra_merged_clean, id_cols = id_cols)
+
+keep_samples_35_hc_with_blanks <- sample_qc_35 %>%
+  filter((!is_nonbiol_control & confidence_class == "high_confidence") | is_nonbiol_control) %>%
+  pull(Sample.Name)
+
+count_35_clean_hc_with_blanks <- count_35_decontam %>%
+  select(any_of(c(id_cols, keep_samples_35_hc_with_blanks)))
+
+vsearch_ra_692_clean_hc_with_blanks <- to_relative_abundance(
+  count_35_clean_hc_with_blanks,
+  id_cols = id_cols
+)
+
+# ------------------------------------------------------------
+# 8) Final summary
+# ------------------------------------------------------------
+cat("Final real 35-cycle samples kept (all clean) =", nrow(meta_35_clean), "\n")
+cat("Final real 35-cycle high-confidence samples =", nrow(meta_35_clean_hc), "\n")
+cat("Final PTW p-trap samples kept (all clean) =", nrow(meta_35_ptrap), "\n")
+cat("Final PTW p-trap high-confidence samples =", nrow(meta_35_ptrap_hc), "\n")
+cat("Final 35-cycle ASVs kept =", nrow(count_35_clean), "\n")
+```
+
+
+## 1) Batch effect and cross-cycle concordance
+
+### 1.1 Sample depth overview
+
+```{r sample_depth}
+`%||%` <- function(x, y) if (is.null(x)) y else x
+
+# ================================================================
+# 2) Sample depth overview
+# ================================================================
+depth_691_int <- get_sample_depth(count_25_clean, id_cols = id_cols) %>%
+  mutate(batch = "25_cycle_clean")
+depth_692_int <- get_sample_depth(count_35_clean, id_cols = id_cols) %>% mutate(batch = "35_cycle_clean")
+depth_35_hc <- get_sample_depth(
+  count_35_clean_hc,
+  id_cols = id_cols
+) %>% mutate(batch = "35_cycle_high_confidence")
+
+depth_all <- bind_rows(
+  depth_691_int,
+  depth_692_int,
+  depth_35_hc
+)
+
+depth_all
+summary(depth_all$total_counts)
+```
+
+### 1.2 Paired 25/35 overlap concordance
+
+```{r paired_overlap}
+# ================================================================
+# 3) Paired 25/35 overlap concordance: all-clean vs HC
+# ================================================================
+run_paired_overlap_variant <- function(ra_35_tbl,
+                                       label_35 = c("35_all", "35_hc"),
+                                       filter_35_samples = NULL,
+                                       make_pdf = FALSE,
+                                       pdf_dir = NULL) {
+  label_35 <- match.arg(label_35)
+
+  overlap_table <- metadata %>%
+    filter(Phenotype %in% c("PTW", "TW", "HW")) %>%
+    add_count(across(all_of(c("Phenotype", "date", "label")))) %>%
+    filter(n > 1) %>%
+    select(-n) %>%
+    arrange(Phenotype, date, label)
+
+  overlap_table_labeled <- overlap_table %>%
+    mutate(base_name = sub("^(.*)_(di(\\.low)?|re.*)$", "\\1", Sample.Name))
+
+  paired_overlap <- overlap_table_labeled %>%
+    group_by(base_name, Phenotype, ptrap, label, date, sampling_time, resting_time, week, dow) %>%
+    filter(all(c(25, 35) %in% PCR.cycles)) %>%
+    ungroup() %>%
+    select(Sample.Order, Sample.Name, base_name, Phenotype, ptrap, label, date,
+           sampling_time, resting_time, week, dow, PCR.cycles) %>%
+    filter(Sample.Name != "PTW_A2_20240715_re2")
+
+  if (!is.null(filter_35_samples)) {
+    paired_overlap <- paired_overlap %>%
+      filter(PCR.cycles == 25 | Sample.Name %in% filter_35_samples)
+  }
+
+  vsearch_ra_lite <- full_join(
+    vsearch_ra_691_clean,
+    ra_35_tbl,
+    by = id_cols,
+    suffix = c("_25", "_35")
+  ) %>%
+  mutate(across(where(is.numeric), ~ replace_na(., 0)))
+
+  sample_cols_tagged <- setdiff(colnames(vsearch_ra_lite), id_cols)
+  sample_cols_base <- gsub("_25$|_35$", "", sample_cols_tagged)
+  if (anyDuplicated(sample_cols_base)) {
+    stop("Duplicate sample names were created while preparing overlap concordance.")
+  }
+  colnames(vsearch_ra_lite)[match(sample_cols_tagged, colnames(vsearch_ra_lite))] <- sample_cols_base
+
+  vsearch_clr_lite <- to_clr(vsearch_ra_lite, id_cols = id_cols)
+  rownames(vsearch_clr_lite) <- vsearch_clr_lite$id
+  asv_mat <- as.matrix(vsearch_clr_lite %>% select(-all_of(id_cols)))
+
+  paired_groups <- paired_overlap %>%
+    arrange(base_name, Phenotype, ptrap, label, date, sampling_time, resting_time, week, dow, PCR.cycles) %>%
+    mutate(pair_id = paste0(base_name, "_", Phenotype, "_p", ptrap, "_", label, "_", date))
+
+  pairs_list <- paired_groups %>%
+    select(pair_id, Sample.Name, PCR.cycles) %>%
+    pivot_wider(names_from = PCR.cycles, values_from = Sample.Name) %>%
+    rename(Samp25 = `25`, Samp35 = `35`) %>%
+    filter(Samp25 %in% colnames(asv_mat), Samp35 %in% colnames(asv_mat))
+
+  overlap_tech <- run_overlap_concordance(asv_mat = asv_mat, pairs_list = pairs_list)
+  overlap_tech_ptw <- run_overlap_concordance(
+    asv_mat = asv_mat,
+    pairs_list = pairs_list %>% filter(grepl("_PTW_", pair_id))
+  )
+
+  rho_results <- tibble(pair_id = character(), spearman_rho = numeric(), spearman_p = numeric())
+
+  if (isTRUE(make_pdf)) {
+    pdf_dir <- pdf_dir %||% file.path(output_root, paste0("paired_scatter_pdfs_", label_35))
+    dir.create(pdf_dir, showWarnings = FALSE, recursive = TRUE)
+  }
+
+  for (i in seq_len(nrow(pairs_list))) {
+    pid <- pairs_list$pair_id[i]
+    samp25 <- pairs_list$Samp25[i]
+    samp35 <- pairs_list$Samp35[i]
+
+    df_pair <- tibble(
+      ASV = rownames(asv_mat),
+      clr25 = asv_mat[, samp25],
+      clr35 = asv_mat[, samp35]
+    )
+
+    cor_test <- cor.test(df_pair$clr25, df_pair$clr35, method = "spearman", exact = FALSE)
+    rho <- unname(cor_test$estimate)
+    pval <- cor_test$p.value
+
+    rho_results <- bind_rows(
+      rho_results,
+      tibble(pair_id = pid, spearman_rho = rho, spearman_p = pval)
+    )
+
+    if (isTRUE(make_pdf)) {
+      pdf_filename <- file.path(pdf_dir, paste0(pid, "_scatter.pdf"))
+      pdf(pdf_filename, width = 5, height = 5)
+      p <- ggplot(df_pair, aes(x = clr25, y = clr35)) +
+        geom_point(size = 0.8, alpha = 0.6) +
+        geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "gray50") +
+        labs(
+          title = sprintf("%s\nSpearman rho = %.3f (p = %.1e)", pid, rho, pval),
+          x = paste0("CLR (", samp25, ")"),
+          y = paste0("CLR (", samp35, ")")
+        ) +
+        theme_bw() +
+        theme(
+          plot.title = element_text(size = 9, hjust = 0.5),
+          axis.title = element_text(size = 9),
+          axis.text = element_text(size = 7)
+        )
+      print(p)
+      dev.off()
+    }
+  }
+
+  p_rho <- ggplot(overlap_tech$pairwise, aes(x = 1, y = spearman_rho)) +
+    geom_boxplot(width = 0.12, outlier.shape = NA) +
+    geom_jitter(width = 0.025, size = 1.2, alpha = 0.8) +
+    scale_x_continuous(limits = c(0.8, 1.2), expand = c(0, 0)) +
+    labs(
+      x = "",
+      y = "Spearman rho"
+    ) +
+    theme_bw() +
+    theme(axis.text.x = element_blank(), axis.ticks.x = element_blank())
+
+  list(
+    pairs_list = pairs_list,
+    overlap_tech = overlap_tech,
+    overlap_tech_ptw = overlap_tech_ptw,
+    rho_results = rho_results,
+    p_rho = p_rho
+  )
+}
+
+overlap_25_vs_35_all <- run_paired_overlap_variant(
+  ra_35_tbl = vsearch_ra_692_clean,
+  label_35 = "35_all",
+  filter_35_samples = meta_35_ptrap$Sample.Name,
+  make_pdf = FALSE
+)
+
+overlap_25_vs_35_hc <- run_paired_overlap_variant(
+  ra_35_tbl = vsearch_ra_692_clean_hc,
+  label_35 = "35_hc",
+  filter_35_samples = meta_35_ptrap_hc$Sample.Name,
+  make_pdf = FALSE
+)
+
+paired_overlap_compare <- tibble(
+  dataset = c("35_all", "35_hc"),
+  n_pairs = c(nrow(overlap_25_vs_35_all$pairs_list), nrow(overlap_25_vs_35_hc$pairs_list)),
+  median_rho = c(
+    median(overlap_25_vs_35_all$overlap_tech$pairwise$spearman_rho, na.rm = TRUE),
+    median(overlap_25_vs_35_hc$overlap_tech$pairwise$spearman_rho, na.rm = TRUE)
+  ),
+  mean_rho = c(
+    mean(overlap_25_vs_35_all$overlap_tech$pairwise$spearman_rho, na.rm = TRUE),
+    mean(overlap_25_vs_35_hc$overlap_tech$pairwise$spearman_rho, na.rm = TRUE)
+  )
+)
+
+
+overlap_25_vs_35_all$overlap_tech$summary
+overlap_25_vs_35_all$overlap_tech_ptw$summary
+overlap_25_vs_35_hc$overlap_tech$summary
+overlap_25_vs_35_hc$overlap_tech_ptw$summary
+paired_overlap_compare
+```
+
+```{r overlap_figs, fig.width=7, fig.height=7}
+overlap_25_vs_35_hc$p_rho
+```
+
+
+
+### 1.3 ASV-level time association under batch-specific analyses
+
+
+```{r top200_time_compare}
+# 4) Top-200 ASV time association: 25 vs 35_all and 25 vs 35_hc
+# ================================================================
+sample_cols_merged <- setdiff(colnames(vsearch_ra_merged_clean), id_cols)
+
+mean_ra_all <- rowMeans(
+  as.matrix(vsearch_ra_merged_clean[, sample_cols_merged, drop = FALSE]),
+  na.rm = TRUE
+)
+
+top200_ids <- vsearch_ra_merged_clean$id[
+  order(mean_ra_all, decreasing = TRUE)[seq_len(min(200, length(mean_ra_all)))]
+]
+
+run_top200_time_compare <- function(clr_35_tbl, meta_35_tbl, title_suffix = "35_all") {
+  clr_25_ptrap_top200 <- clr_25_ptrap %>% filter(id %in% top200_ids)
+  clr_35_ptrap_top200 <- clr_35_tbl %>% filter(id %in% top200_ids)
+
+  meta_25_ptrap_sub <- meta_25_ptrap %>%
+    filter(ptrap %in% c(1, 3))
+
+  results_25_local <- run_asv_time_models(
+    ptrap_clr_df = clr_25_ptrap_top200,
+    metadata = meta_25_ptrap_sub,
+    ptraps_keep = c(1, 3),
+    phenotype_keep = "PTW"
+  )
+
+  results_35_local <- run_asv_time_models(
+    ptrap_clr_df = clr_35_ptrap_top200,
+    metadata = meta_35_tbl,
+    ptraps_keep = c(1, 3),
+    phenotype_keep = "PTW"
+  )
+
+  common_result <- inner_join(results_25_local, results_35_local, by = "id", suffix = c("_25", "_35")) %>%
+    mutate(
+      padj_25 = p.adjust(p.value_25, method = "BH"),
+      padj_35 = p.adjust(p.value_35, method = "BH"),
+      sig25 = padj_25 < 0.05,
+      sig35 = padj_35 < 0.05,
+      sig_both = sig25 & sig35,
+      sign_consistent = sign(estimate_25) == sign(estimate_35),
+      logp25 = -log10(p.value_25),
+      logp35 = -log10(p.value_35),
+      signed_logp25 = if_else(estimate_25 > 0, logp25, -logp25),
+      signed_logp35 = if_else(estimate_35 > 0, logp35, -logp35)
+    )
+
+  summary_tbl <- common_result %>%
+    summarise(
+      n_asv = n(),
+      n_sig_25 = sum(sig25, na.rm = TRUE),
+      n_sig_35 = sum(sig35, na.rm = TRUE),
+      n_sig_both = sum(sig_both, na.rm = TRUE),
+      frac_sign_consistent = mean(sign_consistent, na.rm = TRUE)
+    ) %>%
+    mutate(dataset = title_suffix)
+
+  alpha_sig <- 0.05
+  T <- -log10(alpha_sig)
+  p_scatter <- ggplot(common_result, aes(x = signed_logp25, y = signed_logp35)) +
+    annotate("rect", xmin = -T, xmax = T, ymin = -Inf, ymax = Inf, fill = "grey80", alpha = 0.2) +
+    annotate("rect", xmin = -Inf, xmax = Inf, ymin = -T, ymax = T, fill = "grey80", alpha = 0.2) +
+    geom_vline(xintercept = c(-T, T), linetype = "dotted", linewidth = 0.5) +
+    geom_hline(yintercept = c(-T, T), linetype = "dotted", linewidth = 0.5) +
+    geom_point(aes(color = sig_both), alpha = 0.6) +
+    scale_color_manual(values = c("FALSE" = "grey50", "TRUE" = "firebrick"), name = "Significant in both") +
+    geom_abline(slope = 1, intercept = 0, linetype = "dashed") +
+    labs(
+      x = expression(sign(estimate[25]) * -log[10](p[25])),
+      y = expression(sign(estimate[35]) * -log[10](p[35])),
+      title = paste0("ASV time-trend significance: 25 vs ", title_suffix, " (top 200)")
+    ) +
+    theme_minimal()
+
+  list(
+    results_25 = results_25_local,
+    results_35 = results_35_local,
+    common_result = common_result,
+    summary_tbl = summary_tbl,
+    p_scatter = p_scatter
+  )
+}
+
+top200_compare_35_all <- run_top200_time_compare(
+  clr_35_tbl = clr_35_ptrap,
+  meta_35_tbl = meta_35_ptrap,
+  title_suffix = "35_all"
+)
+
+top200_compare_35_hc <- run_top200_time_compare(
+  clr_35_tbl = clr_35_ptrap_hc,
+  meta_35_tbl = meta_35_ptrap_hc,
+  title_suffix = "35_hc"
+)
+
+top200_compare_summary <- bind_rows(
+  top200_compare_35_all$summary_tbl,
+  top200_compare_35_hc$summary_tbl
+)
+
+
+top200_compare_summary
+```
+
+```{r top200_time, fig.height=8, fig.width=9}
+top200_compare_35_hc$p_scatter
+```
+
+
+## 2) Alpha diversity and PCA structure
+
+### 2.1 Alpha diversity (filtered ASVs only)
+
+```{r alpha_diversity}
+# ================================================================
+# 5) Alpha diversity
+# ================================================================
+div_25_int <- alpha_div_table(
+  vsearch_ra_691_clean,
+  meta_25_ptrap,
+  id_cols = id_cols
+) %>% mutate(cycle = "25_cycle_clean")
+div_35_int <- alpha_div_table(vsearch_ra_692_clean, meta_35_ptrap, id_cols = id_cols) %>% mutate(cycle = "35_cycle_clean")
+div_35_hc <- alpha_div_table(
+  vsearch_ra_692_clean_hc,
+  meta_35_ptrap_hc,
+  id_cols = id_cols
+) %>% mutate(cycle = "35_cycle_high_confidence")
+
+div_all <- bind_rows(div_25_int, div_35_int, div_35_hc)
+
+alpha_summary <- div_all %>%
+  group_by(cycle, ptrap) %>%
+  summarise(
+    n = n(),
+    mean_shannon = mean(shannon, na.rm = TRUE),
+    mean_simpson = mean(simpson, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+alpha_summary
+```
+
+```{r alpha_diversity_figs, fig.height=10, fig.width=10}
+(
+  plot_alpha_ts(div_25_int, metric = "shannon", title = "25-cycle: Shannon") |
+  plot_alpha_ts(div_25_int, metric = "simpson", title = "25-cycle: Simpson")
+) /
+(
+  plot_alpha_ts(div_35_int, metric = "shannon", title = "35-cycle clean: Shannon") |
+  plot_alpha_ts(div_35_int, metric = "simpson", title = "35-cycle clean: Simpson")
+) /
+(
+  plot_alpha_ts(div_35_hc, metric = "shannon", title = "35-cycle HC: Shannon") |
+  plot_alpha_ts(div_35_hc, metric = "simpson", title = "35-cycle HC: Simpson")
+)
+```
+
+### 2.2 Global PCA across all filtered samples
+
+```{r global_pca}
+run_global_pca_variant <- function(vsearch_ra_35_tbl, meta_35_tbl, pairs_list_variant, title_suffix) {
+  vsearch_ra_merged_variant <- full_join(
+    vsearch_ra_691_clean_with_blanks,
+    vsearch_ra_35_tbl,
+    by = id_cols,
+    suffix = c("_691", "_692")
+  ) %>%
+  mutate(across(where(is.numeric), ~ replace_na(., 0)))
+
+  vsearch_clr_global_variant <- to_clr(vsearch_ra_merged_variant, id_cols = id_cols)
+
+  global_pca <- fit_pca_from_clr(
+    clr_tbl = vsearch_clr_global_variant,
+    id_cols = id_cols,
+    sample_names = setdiff(colnames(vsearch_clr_global_variant), id_cols),
+    n_pc = 2,
+    feature_id_col = "id"
+  )
+
+  global_var <- pca_var_explained(global_pca$pca, n = 5)
+
+  global_scores <- global_pca$scores %>%
+    left_join(
+      metadata %>%
+        select(Sample.Name, PCR.cycles, Phenotype, ptrap, date) %>%
+        rename(sample_type = Phenotype),
+      by = "Sample.Name"
+    ) %>%
+    mutate(batch = factor(PCR.cycles))
+
+  global_segments <- pairs_list_variant %>%
+    pivot_longer(cols = c(Samp25, Samp35), names_to = "batch_role", values_to = "Sample.Name") %>%
+    left_join(global_scores %>% select(Sample.Name, PC1, PC2), by = "Sample.Name") %>%
+    group_by(pair_id) %>%
+    arrange(batch_role, .by_group = TRUE) %>%
+    mutate(
+      PC1_next = lead(PC1),
+      PC2_next = lead(PC2)
+    ) %>%
+    ungroup() %>%
+    filter(!is.na(PC1_next), !is.na(PC2_next))
+
+  p <- ggplot(global_scores, aes(x = PC1, y = PC2, shape = sample_type, color = batch)) +
+    geom_point(size = 2, na.rm = TRUE) +
+    geom_segment(
+      data = global_segments,
+      aes(x = PC1, y = PC2, xend = PC1_next, yend = PC2_next),
+      inherit.aes = FALSE,
+      arrow = grid::arrow(length = grid::unit(0.1, "inches")),
+      linewidth = 0.5,
+      color = "grey"
+    ) +
+    theme_minimal() +scale_shape_discrete(
+    labels = c(
+      HW  = "Handwashing water",
+      PTS = "P-trap surface",
+      PTW = "P-trap water",
+      TW  = "Tap water"
+    ),
+    na.translate = FALSE
+  ) +
+    labs(
+      x = paste0("PC1 (", global_var[1], "%)"),
+      y = paste0("PC2 (", global_var[2], "%)"),
+      shape = "Sample type",
+      color = "Batch"
+    )
+
+  list(
+    global_pca = global_pca,
+    global_var = global_var,
+    global_scores = global_scores,
+    global_segments = global_segments,
+    p = p
+  )
+}
+global_pca_35_all <- run_global_pca_variant(
+  vsearch_ra_35_tbl = vsearch_ra_692_clean_with_blanks,
+  pairs_list_variant = overlap_25_vs_35_all$pairs_list,
+  title_suffix = "35-cycle cleaned"
+)
+global_pca_35_hc <- run_global_pca_variant(
+  vsearch_ra_35_tbl = vsearch_ra_692_clean_hc_with_blanks,
+  pairs_list_variant = overlap_25_vs_35_hc$pairs_list,
+  title_suffix = "35-cycle high-confidence"
+)
+
+global_pca_35_all$global_var
+global_pca_35_hc$global_var
+```
+
+```{r global_pca_plot, fig.height=9, fig.width=10.5}
+global_pca_35_hc$p$data <- global_pca_35_hc$p$data %>%
+  mutate(
+    sample_type = factor(
+      as.character(sample_type),
+      levels = c("control/blank", "HW", "PTS", "PTW", "TW")
+    ),
+    batch = factor(as.character(batch), levels = c("25", "35"))
+  )
+
+global_pca_35_hc$p <- global_pca_35_hc$p +
+  aes(color = sample_type, shape = batch) +
+  scale_color_manual(
+    values = c(
+      "control/blank" = "grey40",
+      "HW"            = "#F17C67",
+      "PTS"           = "#DDD23B",
+      "PTW"           = "#51A8DD",
+      "TW"            = "#90B44B"
+    ),
+    labels = c(
+      "control/blank" = "control/blank",
+      "HW"            = "Handwashing water",
+      "PTS"           = "P-trap surface",
+      "PTW"           = "P-trap water",
+      "TW"            = "Tap water"
+    ),
+    na.translate = FALSE,
+    drop = FALSE
+  ) +
+  scale_shape_manual(
+    values = c(
+      "25" = 16,  # solid circle
+      "35" = 1    # open circle
+    ),
+    labels = c(
+      "25" = "25-cycle",
+      "35" = "35-cycle"
+    ),
+    drop = FALSE
+  ) +
+  labs(
+    color = "Sample type",
+    shape = "PCR batch"
+  ) +
+  guides(
+    color = guide_legend(order = 1, override.aes = list(shape = 16, size = 3)),
+    shape = guide_legend(order = 2, override.aes = list(color = "black", size = 3))
+  )
+
+global_pca_35_hc$p
+```
+
+
+```{r pca_ptrap_plot_helper}
+plot_pca_highlight_ptrap <- function(df, ptrap_id, expl1, expl2) {
+  df_bg <- df %>% dplyr::filter(ptrap != ptrap_id)
+  df_fg <- df %>% dplyr::filter(ptrap == ptrap_id)
+  group_label <- dplyr::case_when(
+    as.character(ptrap_id) %in% c("1", "3") ~ "Treatment",
+    as.character(ptrap_id) == "2" ~ "Control",
+    TRUE ~ "Unknown"
+  )
+    ggplot() +
+    geom_point(
+      data = df_bg,
+      aes(x = PC1, y = PC2),
+      color = "grey80",
+      size = 1.2,
+      alpha = 0.7
+    ) +
+    geom_point(
+      data = df_fg,
+      aes(x = PC1, y = PC2, color = week),
+      size = 2
+    ) +
+    theme_minimal() +
+    labs(
+      title = paste0("P-trap ", ptrap_id, " (", group_label, ")"),
+      x = paste0("PC1 (", expl1, "%)"),
+      y = paste0("PC2 (", expl2, "%)")
+    )
+}
+```
+
+### 2.3 P-trap-only PCA within the 25-cycle batch
+
+```{r pca_25_ptrap}
+pca_25_ptrap_fit <- fit_pca_from_clr(
+  clr_tbl = clr_25_ptrap,
+  id_cols = id_cols,
+  sample_names = meta_25_ptrap$Sample.Name,
+  n_pc = 2,
+  feature_id_col = "id"
+)
+
+scores_25_ptrap <- pca_25_ptrap_fit$scores %>%
+  left_join(
+    metadata %>% select(Sample.Name, ptrap, Phenotype, date, week, dow),
+    by = "Sample.Name"
+  ) %>%
+  arrange(Phenotype, date)
+
+var_25_ptrap <- pca_var_explained(pca_25_ptrap_fit$pca, n = 5)
+
+scores_25_ptrap$week <- as.factor(scores_25_ptrap$week)
+scores_25_ptrap$ptrap <- as.factor(scores_25_ptrap$ptrap)
+```
+
+```{r fig.height=5, fig.width=16} 
+scores_25_ptrap$week <- as.numeric(as.character(scores_25_ptrap$week))
+
+week_scale <- scale_color_gradient(
+  low = "#4DA3FF",
+  high = "#08306B",
+  limits = range(scores_25_ptrap$week, na.rm = TRUE),
+  breaks = c(2, 4, 6, 8, 10, 12, 14),
+  name = "Week"
+)
+
+PCA_ptrap1_25 <- plot_pca_highlight_ptrap(
+  scores_25_ptrap, 1, var_25_ptrap[1], var_25_ptrap[2]
+) + week_scale + labs(title = "Handwashing p-trap 1")
+
+PCA_ptrap2_25 <- plot_pca_highlight_ptrap(
+  scores_25_ptrap, 2, var_25_ptrap[1], var_25_ptrap[2]
+) + week_scale + labs(title = "Tap water p-trap")
+
+PCA_ptrap3_25 <- plot_pca_highlight_ptrap(
+  scores_25_ptrap, 3, var_25_ptrap[1], var_25_ptrap[2]
+) + week_scale + labs(title = "Handwashing p-trap 2")
+
+legend_right <- theme(legend.position = "right")
+(PCA_ptrap1_25 + legend_right |
+   PCA_ptrap3_25 + legend_right |
+   PCA_ptrap2_25 + legend_right) +
+  plot_layout(guides = "collect")
+```
+
+
+
+
+### 2.4 P-trap-only PCA within the 35-cycle batch
+
+```{r pca_35_ptrap}
+
+run_ptrap_pca_variant <- function(clr_tbl, meta_tbl) {
+  fit <- fit_pca_from_clr(
+    clr_tbl = clr_tbl,
+    id_cols = id_cols,
+    sample_names = meta_tbl$Sample.Name,
+    n_pc = 2,
+    feature_id_col = "id"
+  )
+
+  scores <- fit$scores %>%
+    left_join(
+      meta_tbl %>% select(Sample.Name, ptrap, Phenotype, date, week, dow),
+      by = "Sample.Name"
+    ) %>%
+    arrange(Phenotype, date)
+
+  var_expl <- pca_var_explained(fit$pca, n = 5)
+  scores$week <- as.numeric(scores$week)
+  scores$ptrap <- as.factor(scores$ptrap)
+
+  list(
+    fit = fit,
+    scores = scores,
+    var_expl = var_expl,
+    p1 = plot_pca_highlight_ptrap(scores, 1, var_expl[1], var_expl[2]),
+    p2 = plot_pca_highlight_ptrap(scores, 2, var_expl[1], var_expl[2]),
+    p3 = plot_pca_highlight_ptrap(scores, 3, var_expl[1], var_expl[2])
+  )
+}
+
+
+pca_35_hc <- run_ptrap_pca_variant(clr_35_ptrap_hc, meta_35_ptrap_hc)
+
+p_pca_35_hc <- (pca_35_hc$p1 + week_scale + labs(title = "Handwashing p-trap 1") | pca_35_hc$p3 + week_scale + labs(title = "Handwashing p-trap 2") | pca_35_hc$p2 + week_scale + labs(title = "Tap water p-trap"))
+
+```
+
+```{r fig.height=9, fig.width=16}
+row_25 <- PCA_ptrap1_25 | PCA_ptrap3_25 | PCA_ptrap2_25
+row_35 <- p_pca_35_hc
+
+pca_cycle_comparison <- (
+  wrap_elements(row_25) /
+  wrap_elements(row_35)
+) +
+  plot_annotation(
+    tag_levels = "A",
+    theme = theme(
+      plot.tag = element_text(size = 16, face = "bold"),
+      plot.tag.position = c(0, 1)
+    )
+  )
+
+pca_cycle_comparison
+```
+
+
+## 3) PCA-axis GAM and longitudinal dynamics
+
+### 3.1 Run batch-level PCA-axis modules
+
+```{r run_longitudinal_pca_analyses}
+longitudinal_25 <- run_longitudinal_pca_analysis(
+  clr_tbl = clr_25_ptrap,
+  metadata_batch = meta_25_ptrap,
+  id_cols = id_cols,
+  batch_label = "25_cycle",
+  treated_ptraps = c(1, 3),
+  control_ptrap = 2,
+  n_pc = 2,
+  top_k = 20,
+  train_frac = 0.7,
+  min_train_pairs = 4,
+  k_time = 6
+)
+
+# ================================================================
+# 7) PCA-axis longitudinal analysis
+# ================================================================
+longitudinal_35 <- run_longitudinal_pca_analysis(
+  clr_tbl = clr_35_ptrap,
+  metadata_batch = meta_35_ptrap,
+  id_cols = id_cols,
+  batch_label = "35_cycle",
+  treated_ptraps = c(1, 3),
+  control_ptrap = 2,
+  n_pc = 2,
+  top_k = 20,
+  train_frac = 0.7,
+  min_train_pairs = 4,
+  k_time = 6
+)
+
+
+longitudinal_35_hc <- run_longitudinal_pca_analysis(
+  clr_tbl = clr_35_ptrap_hc,
+  metadata_batch = meta_35_ptrap_hc,
+  id_cols = id_cols,
+  batch_label = "35_cycle_high_confidence",
+  treated_ptraps = c(1, 3),
+  control_ptrap = 2,
+  n_pc = 2,
+  top_k = 20,
+  train_frac = 0.7,
+  min_train_pairs = 4,
+  k_time = 6
+)
+
+axis_shift_35_compare <- bind_rows(
+  longitudinal_35$axis_shift %>% mutate(dataset = "35_all"),
+  longitudinal_35_hc$axis_shift %>% mutate(dataset = "35_hc")
+)
+
+```
+
+### 3.2 Axis shift summaries
+
+```{r axis_shift_summaries}
+longitudinal_25$axis_shift
+longitudinal_35$axis_shift
+longitudinal_35_hc$axis_shift
+axis_shift_35_compare
+```
+
+
+### 3.3 Treatment-level and ptrap-level GAM summaries
+
+```{r gam_summaries}
+longitudinal_25$treatment_gam_summary
+longitudinal_25$ptrap_gam_summary
+longitudinal_35$treatment_gam_summary
+longitudinal_35$ptrap_gam_summary
+longitudinal_35_hc$treatment_gam_summary
+longitudinal_35_hc$ptrap_gam_summary
+```
+
+```{r longitudinal_axis_figs_25, fig.height=4, fig.width=12}
+plot_axis_trajectory(longitudinal_25$axis_df, axis = "PC1") | plot_axis_trajectory(longitudinal_25$axis_df, axis = "PC2")
+```
+
+```{r longitudinal_smooth_figs_25, fig.height=4, fig.width=12}
+p1 <- plot_treatment_smooth(
+  axis_df = longitudinal_25$axis_df,
+  gam_list = longitudinal_25$treatment_gams,
+  axis = "PC1",
+  dataset_label = "25-cycle"
+)
+
+p2 <- plot_treatment_smooth(
+  axis_df = longitudinal_25$axis_df,
+  gam_list = longitudinal_25$treatment_gams,
+  axis = "PC2",
+  dataset_label = "25-cycle"
+)
+
+group_color_scale <- scale_color_discrete(
+    name = "Group",
+    labels = c(
+      "Control" = "tap water p-trap",
+      "Treated" = "handwashing p-trap"
+    )
+  )
+group_fill_scale <- scale_fill_discrete(
+    name = "Group",
+    labels = c(
+      "Control" = "tap water p-trap",
+      "Treated" = "handwashing p-trap"
+    )
+  )
+
+(p1 + group_color_scale + group_fill_scale |
+   p2 + group_color_scale + group_fill_scale)
+```
+
+```{r fig.height=9, fig.width=12}
+row_25 <- p1 | p2
+row_35 <- plot_treatment_smooth(
+    axis_df = longitudinal_35_hc$axis_df,
+    gam_list = longitudinal_35_hc$treatment_gams,
+    axis = "PC1",
+    dataset_label = "35-cycle"
+  ) |
+  plot_treatment_smooth(
+    axis_df = longitudinal_35_hc$axis_df,
+    gam_list = longitudinal_35_hc$treatment_gams,
+    axis = "PC2",
+    dataset_label = "35-cycle"
+  )
+
+smooth_cycle_comparison <- (
+  wrap_elements(row_25) /
+  wrap_elements(row_35)
+) +
+  plot_annotation(
+    tag_levels = "A",
+    theme = theme(
+      plot.tag = element_text(size = 16, face = "bold"),
+      plot.tag.position = c(0, 1)
+    )
+  )
+
+smooth_cycle_comparison
+```
+
+### Save cache for downstream steps
+
+```{r}
+pca_25_ptrap <- pca_25_ptrap_fit$pca
+scores_35_all <- longitudinal_35$axis_df
+scores_35_hc <- pca_35_hc$scores
+
+part1_cache_names <- c(
+  "id_cols", "metadata", "sample_qc_35", "count_35_decontam",
+  "vsearch_ra_691_clean_with_blanks", "vsearch_ra_692_clean_with_blanks",
+  "meta_25_ptrap", "ra_25_ptrap",
+  "meta_35_ptrap", "ra_35_ptrap",
+  "meta_35_ptrap_hc", "ra_35_ptrap_hc",
+  "vsearch_clr_global_clean", "pca_25_ptrap", "scores_25_ptrap",
+  "scores_35_all", "scores_35_hc"
+)
+missing_cache_objects <- setdiff(part1_cache_names, ls())
+if (length(missing_cache_objects) > 0) {
+  stop("Cannot create part 1 cache; missing: ", paste(missing_cache_objects, collapse = ", "))
+}
+part1_cache_objects <- mget(part1_cache_names, inherits = FALSE)
+saveRDS(part1_cache_objects, part1_cache_file, compress = "gzip")
+```

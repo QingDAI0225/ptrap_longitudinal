@@ -1,0 +1,602 @@
+---
+title: "03-data_visualization"
+output: html_document
+---
+
+```{r setup, message=FALSE, warning=FALSE}
+suppressPackageStartupMessages({
+  library(ggplot2)
+  library(tidyr)
+  library(dplyr)
+  library(patchwork)
+})
+
+theme_set(theme_bw())
+options(stringsAsFactors = FALSE)
+```
+
+```{r}
+code_dir <- normalizePath(getwd(), mustWork = TRUE)
+workspace_dir <- normalizePath(file.path(code_dir, ".."), mustWork = TRUE)
+cache_dir <- path.expand(Sys.getenv(
+  "PTRAP_CACHE_DIR",
+  unset = file.path(workspace_dir, "cache")
+))
+part2_results_file <- file.path(cache_dir, "part2_source_support_results.rds")
+
+stopifnot(file.exists(part2_results_file))
+
+part2_source_results <- readRDS(part2_results_file)
+list2env(part2_source_results, envir = environment())
+
+message("Loaded part 2 results from: ", part2_results_file)
+```
+
+### Main summaries
+
+```{r clr_source_main_summaries}
+res_cmp_25_overall_summary
+res_cmp_35_overall_summary
+res_cmp_35_hc_overall_summary
+source_compare_35_overall
+source_compare_35_phase
+source_compare_35_ptrap
+source_compare_35_delta
+
+source_grouped_support_compare_35 %>%
+  dplyr::filter(external_spec == "prev_day")
+
+source_grouped_support_phase_compare_35 %>%
+  dplyr::filter(external_spec == "prev_day")
+
+source_delta_ci_compare_35_overall %>%
+  dplyr::filter(external_spec == "prev_day")
+
+source_delta_ci_compare_35_by_phase %>%
+  dplyr::filter(external_spec == "prev_day")
+```
+
+### External-source sensitivity
+
+```{r clr_source_sensitivity_tables}
+source_sensitivity_compare_35
+source_phase_sensitivity_compare_35
+
+source_grouped_support_compare_35
+source_grouped_support_phase_compare_35
+
+source_delta_ci_compare_35_overall
+source_delta_ci_compare_35_by_phase
+```
+
+
+```{r}
+make_delta_boxplot <- function(df,
+                               keep_contrasts = c("External over blank", "Lag over blank"),
+                               title = expression("Phase-specific incremental support (" * Delta * R^2 * ")")) {
+  df_plot <- df %>%
+    dplyr::filter(contrast %in% keep_contrasts)
+
+  no_finite_values <- nrow(df_plot) == 0L || !any(is.finite(df_plot$delta_r2))
+  if (no_finite_values) {
+    dataset_levels <- unique(as.character(df$dataset))
+    if (length(dataset_levels) == 0L) dataset_levels <- "dataset unavailable"
+    df_plot <- tidyr::expand_grid(
+      dataset = dataset_levels,
+      contrast = keep_contrasts,
+      phase = factor(c("early", "mid", "late"), levels = c("early", "mid", "late"))
+    ) %>%
+      dplyr::mutate(delta_r2 = NA_real_)
+  }
+
+  p <- ggplot(df_plot, aes(x = phase, y = delta_r2)) +
+    geom_hline(yintercept = 0, linetype = "dashed", linewidth = 0.5, color = "grey40")
+
+  if (!no_finite_values) {
+    p <- p +
+      geom_boxplot(
+        fill = "grey80",
+        width = 0.58,
+        outlier.shape = NA,
+        alpha = 0.72,
+        color = "grey25"
+      ) +
+      geom_jitter(
+        width = 0.10,
+        height = 0,
+        size = 1.3,
+        alpha = 0.45,
+        color = "black"
+      ) +
+      stat_summary(
+        fun = median,
+        geom = "point",
+        shape = 23,
+        size = 2.7,
+        fill = "white",
+        color = "black"
+      )
+  }
+
+  p <- p +
+    facet_grid(contrast ~ dataset, scales = "free_y") +
+    labs(
+      x = NULL,
+      y = expression(Delta * R^2)
+    ) +
+    theme_bw(base_size = 12) +
+    theme(
+      panel.grid.minor = element_blank(),
+      strip.background = element_rect(fill = "grey95", color = "grey70"),
+      legend.position = "none"
+    )
+
+  if (no_finite_values) {
+    notice <- df_plot %>%
+      dplyr::distinct(dataset, contrast) %>%
+      dplyr::mutate(phase = factor("mid", levels = c("early", "mid", "late")), delta_r2 = 0)
+    p <- p + geom_text(
+      data = notice,
+      aes(x = phase, y = delta_r2, label = "No finite delta-R2 values"),
+      inherit.aes = FALSE,
+      color = "grey35",
+      size = 3
+    )
+  }
+
+  p
+}
+
+wilcox_early_vs_late_p <- function(y, phase, min_n = 2) {
+  y_early <- y[phase == "early" & !is.na(y)]
+  y_late  <- y[phase == "late"  & !is.na(y)]
+
+  if (length(y_early) < min_n || length(y_late) < min_n) {
+    return(NA_real_)
+  }
+
+  stats::wilcox.test(
+    y_early,
+    y_late,
+    exact = FALSE
+  )$p.value
+}
+
+format_p_label <- function(p, prefix = "FDR p") {
+  dplyr::case_when(
+    is.na(p) ~ "n too small",
+    p < 0.001 ~ paste0(prefix, " < 0.001"),
+    TRUE ~ paste0(prefix, " = ", formatC(p, format = "f", digits = 3))
+  )
+}
+
+make_early_late_stats <- function(df,
+                                  facet_vars,
+                                  keep_contrasts = c("External over blank", "Lag over blank"),
+                                  adjust_method = "BH",
+                                  label_prefix = "FDR p") {
+  df_test <- df %>%
+    dplyr::filter(
+      contrast %in% keep_contrasts,
+      phase %in% c("early", "late"),
+      !is.na(delta_r2)
+    )
+
+  test_tbl <- df_test %>%
+    dplyr::group_by(dplyr::across(dplyr::all_of(facet_vars))) %>%
+    dplyr::summarise(
+      n_early = sum(phase == "early"),
+      n_late = sum(phase == "late"),
+      p_value = wilcox_early_vs_late_p(delta_r2, phase),
+      y_min = min(delta_r2, na.rm = TRUE),
+      y_max = max(delta_r2, na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    dplyr::mutate(
+      p_adj = p.adjust(p_value, method = adjust_method),
+      label = format_p_label(p_adj, prefix = label_prefix),
+      y_range = dplyr::if_else(
+        is.finite(y_max - y_min) & (y_max - y_min) > 0,
+        y_max - y_min,
+        0.01
+      ),
+      y = y_max + 0.10 * y_range,
+      y_tip = y_max + 0.04 * y_range,
+      y_label = y_max + 0.18 * y_range,
+      x_start = "early",
+      x_end = "late",
+      x_label = "mid"
+    )
+
+  test_tbl
+}
+
+early_midlate_sig_layers <- function(stat_tbl,
+                                     text_size = 3,
+                                     line_width = 0.35) {
+  list(
+    geom_segment(
+      data = stat_tbl,
+      aes(x = x_start, xend = x_end, y = y, yend = y),
+      inherit.aes = FALSE,
+      linewidth = line_width
+    ),
+    geom_segment(
+      data = stat_tbl,
+      aes(x = x_start, xend = x_start, y = y_tip, yend = y),
+      inherit.aes = FALSE,
+      linewidth = line_width
+    ),
+    geom_segment(
+      data = stat_tbl,
+      aes(x = x_end, xend = x_end, y = y_tip, yend = y),
+      inherit.aes = FALSE,
+      linewidth = line_width
+    ),
+    geom_text(
+      data = stat_tbl,
+      aes(x = x_label, y = y_label, label = label),
+      inherit.aes = FALSE,
+      size = text_size
+    )
+  )
+}
+
+```
+
+```{r fig.height=4, fig.width=8}
+delta_25_early_late_stats <- make_early_late_stats(
+  delta_25,
+  facet_vars = "contrast",
+  adjust_method = "none",
+  label_prefix = "p"
+)
+
+make_delta_boxplot(delta_25) +
+  facet_grid(
+    . ~ contrast,
+    scales = "free_y",
+    labeller = labeller(
+      contrast = c(
+        "External over blank" = "Recent external input",
+        "Lag over blank" = "Previous p-trap state"
+      )
+    )
+  ) +
+  labs(
+    x = NULL,
+    y = expression("Extra variance explained  (" * Delta * R^2 * ")")
+  ) +
+  early_midlate_sig_layers(delta_25_early_late_stats, text_size = 3)
+```
+
+
+```{r}
+extract_delta_from_comparison_tbl <- function(comparison_tbl,
+                                              dataset_label,
+                                              external_spec_label) {
+  comparison_tbl %>%
+    dplyr::select(
+      Sample.Name,
+      ptrap,
+      date,
+      phase,
+      delta_ext_over_blank,
+      delta_lag_over_blank
+    ) %>%
+    tidyr::pivot_longer(
+      cols = c(delta_ext_over_blank, delta_lag_over_blank),
+      names_to = "contrast",
+      values_to = "delta_r2"
+    ) %>%
+    dplyr::mutate(
+      dataset = dataset_label,
+      external_spec = external_spec_label,
+      contrast = dplyr::recode(
+        contrast,
+        delta_ext_over_blank = "External over blank",
+        delta_lag_over_blank = "Lag over blank"
+      ),
+      phase = factor(phase, levels = c("early", "mid", "late")),
+      external_spec = factor(
+        external_spec,
+        levels = c("prev_day", "recent_3d", "recent_3d_decay"),
+        labels = c("1 d summary", "3 d summary", "3 d decay")
+      )
+    ) %>%
+    dplyr::select(dataset, external_spec, phase, contrast, delta_r2)
+}
+
+delta_25_sensitivity <- dplyr::bind_rows(
+  extract_delta_from_comparison_tbl(
+    source_comparison_tables_25$prev_day,
+    dataset_label = "25-cycle",
+    external_spec_label = "prev_day"
+  ),
+  extract_delta_from_comparison_tbl(
+    source_comparison_tables_25$recent_3d,
+    dataset_label = "25-cycle",
+    external_spec_label = "recent_3d"
+  ),
+  extract_delta_from_comparison_tbl(
+    source_comparison_tables_25$recent_3d_decay,
+    dataset_label = "25-cycle",
+    external_spec_label = "recent_3d_decay"
+  )
+)
+
+```
+
+```{r}
+delta_35_sensitivity <- dplyr::bind_rows(
+  extract_delta_from_comparison_tbl(
+    source_comparison_tables_35_hc$prev_day,
+    dataset_label = "35-cycle",
+    external_spec_label = "prev_day"
+  ),
+  extract_delta_from_comparison_tbl(
+    source_comparison_tables_35_hc$recent_3d,
+    dataset_label = "35-cycle",
+    external_spec_label = "recent_3d"
+  ),
+  extract_delta_from_comparison_tbl(
+    source_comparison_tables_35_hc$recent_3d_decay,
+    dataset_label = "35-cycle",
+    external_spec_label = "recent_3d_decay"
+  )
+)
+
+```
+
+```{r}
+delta_sensitivity_both <- dplyr::bind_rows(delta_25_sensitivity, delta_35_sensitivity)
+
+p_delta_box_sensitivity_both <- ggplot(delta_sensitivity_both, aes(x = phase, y = delta_r2)) +
+  geom_hline(yintercept = 0, linetype = "dashed", linewidth = 0.5, color = "grey40") +
+  geom_boxplot(
+    fill = "grey80",
+    width = 0.58,
+    outlier.shape = NA,
+    alpha = 0.72,
+    color = "grey25"
+  ) +
+  geom_jitter(
+    width = 0.10,
+    height = 0,
+    size = 1.15,
+    alpha = 0.38,
+    color = "black"
+  ) +
+  stat_summary(
+    fun = median,
+    geom = "point",
+    shape = 23,
+    size = 2.4,
+    fill = "white",
+    color = "black"
+  ) +
+  facet_grid(
+    contrast + dataset ~ external_spec,
+    scales = "free_y"
+  ) +
+  labs(
+    x = NULL,
+    y = expression(Delta * R^2)
+  ) +
+  theme_bw(base_size = 11.5) +
+  theme(
+    panel.grid.minor = element_blank(),
+    strip.background = element_rect(fill = "grey95", color = "grey70"),
+    legend.position = "none"
+  )
+```
+
+```{r fig.height=10, fig.width=10}
+delta_sensitivity_both_early_late_stats <- make_early_late_stats(
+  delta_sensitivity_both,
+  facet_vars = c("contrast", "dataset", "external_spec"),
+  adjust_method = "none",
+  label_prefix = "p"
+)
+
+p_delta_box_sensitivity_both +
+  early_midlate_sig_layers(
+    delta_sensitivity_both_early_late_stats,
+    text_size = 2.4,
+    line_width = 0.3
+  )
+```
+
+## CLR taxon-level attribution
+
+```{r}
+extract_species_label <- function(x, fallback_to_genus = TRUE) {
+  x <- as.character(x)
+
+  vapply(strsplit(x, ";", fixed = TRUE), function(parts) {
+    sp <- parts[grepl("^s__", parts)]
+    if (length(sp) > 0) {
+      out <- sub("^s__", "", sp[1])
+      if (!is.na(out) && nzchar(out)) return(out)
+    }
+
+    if (fallback_to_genus) {
+      gn <- parts[grepl("^g__", parts)]
+      if (length(gn) > 0) {
+        out <- sub("^g__", "", gn[1])
+        if (!is.na(out) && nzchar(out)) return(out)
+      }
+    }
+
+    sub("^.*__", "", tail(parts, 1))
+  }, character(1))
+}
+
+```
+
+### Treated p-traps: external-input and lag attribution
+
+```{r}
+make_taxon_phase_summary_filtered <- function(feature_level_tbl,
+                                              ptraps_keep = c("1", "3"),
+                                              phases_keep = c("early", "late")) {
+  feature_level_tbl %>%
+    dplyr::mutate(
+      ptrap = as.character(ptrap),
+      phase = as.character(phase)
+    ) %>%
+    dplyr::filter(
+      ptrap %in% ptraps_keep,
+      phase %in% phases_keep
+    ) %>%
+    dplyr::group_by(phase, taxon_label) %>%
+    dplyr::summarise(
+      n_samples = dplyr::n_distinct(Sample.Name),
+      prevalence_in_phase = mean(observed_ra > 0, na.rm = TRUE),
+
+      sum_imp_ext_over_blank = sum(improve_ext_over_blank, na.rm = TRUE),
+      mean_imp_ext_over_blank = mean(improve_ext_over_blank, na.rm = TRUE),
+      median_imp_ext_over_blank = median(improve_ext_over_blank, na.rm = TRUE),
+      prop_pos_ext_over_blank = mean(improve_ext_over_blank > 0, na.rm = TRUE),
+
+      sum_imp_lag_over_blank = sum(improve_lag_over_blank, na.rm = TRUE),
+      mean_imp_lag_over_blank = mean(improve_lag_over_blank, na.rm = TRUE),
+      median_imp_lag_over_blank = median(improve_lag_over_blank, na.rm = TRUE),
+      prop_pos_lag_over_blank = mean(improve_lag_over_blank > 0, na.rm = TRUE),
+
+      .groups = "drop"
+    ) %>%
+    dplyr::mutate(
+      phase = factor(phase, levels = c("early", "mid", "late"))
+    )
+}
+
+taxon_phase_summary_25_treated <- make_taxon_phase_summary_filtered(
+  res_taxon_25_feature_level,
+  ptraps_keep = c("1", "3")
+)
+
+taxon_phase_summary_35_hc_treated <- make_taxon_phase_summary_filtered(
+  res_taxon_35_hc_feature_level,
+  ptraps_keep = c("1", "3")
+)
+```
+
+
+```{r}
+make_taxa_bar_from_summary <- function(taxon_phase_summary,
+                                       phase_keep,
+                                       value_col,
+                                       title,
+                                       xlab,
+                                       top_n = 15,
+                                       min_prev = 0.10,
+                                       min_n = 3) {
+  value_col <- rlang::ensym(value_col)
+
+  plot_tbl <- taxon_phase_summary %>%
+    dplyr::filter(
+      as.character(phase) == phase_keep,
+      prevalence_in_phase >= min_prev,
+      n_samples >= min_n
+    ) %>%
+    dplyr::arrange(desc(!!value_col)) %>%
+    dplyr::slice_head(n = top_n) %>%
+    dplyr::mutate(
+      short_label = extract_species_label(taxon_label, fallback_to_genus = TRUE),
+      short_label = make.unique(short_label),
+      short_label = forcats::fct_reorder(short_label, !!value_col)
+    )
+
+  ggplot(plot_tbl, aes(x = !!value_col, y = short_label)) +
+    geom_col(fill = "grey40") +
+    labs(
+      title = title,
+      x = xlab,
+      y = NULL
+    ) +
+    theme_bw(base_size = 11.5) +
+    theme(
+      panel.grid.minor = element_blank(),
+      plot.title = element_text(size = 13, face = "bold", hjust = 0.5),
+      axis.text.y = element_text(size = 9)
+    )
+}
+
+taxon_panel_theme <- theme(
+  plot.title = element_text(size = 13, face = "bold", hjust = 0.5),
+  plot.tag = element_text(size = 16, face = "bold"),
+  plot.tag.position = c(0, 1),
+  axis.title.x = element_text(size = 11),
+  axis.text.y = element_text(size = 9),
+  plot.margin = margin(5, 5, 5, 5)
+)
+```
+
+```{r fig.height=5, fig.width=12}
+p25_ext_over_blank_treated <- make_taxa_bar_from_summary(
+  taxon_phase_summary = taxon_phase_summary_25_treated,
+  phase_keep = "early",
+  value_col = sum_imp_ext_over_blank,
+  title = "25-cycle: early colonizers",
+  xlab = "Summed attribution score\n(external over blank)",
+  top_n = 15,
+  min_prev = 0.10,
+  min_n = 3
+)
+
+p25_lag_over_blank_treated <- make_taxa_bar_from_summary(
+  taxon_phase_summary = taxon_phase_summary_25_treated,
+  phase_keep = "late",
+  value_col = sum_imp_lag_over_blank,
+  title = "25-cycle: late persistent taxa",
+  xlab = "Summed attribution score\n(lag over blank)",
+  top_n = 15,
+  min_prev = 0.10,
+  min_n = 5
+)
+
+p35_ext_over_blank_treated <- make_taxa_bar_from_summary(
+  taxon_phase_summary = taxon_phase_summary_35_hc_treated,
+  phase_keep = "early",
+  value_col = sum_imp_ext_over_blank,
+  title = "35-cycle: early colonizers",
+  xlab = "Summed attribution score\n(external over blank)",
+  top_n = 15,
+  min_prev = 0.10,
+  min_n = 3
+)
+
+p35_lag_over_blank_treated <- make_taxa_bar_from_summary(
+  taxon_phase_summary = taxon_phase_summary_35_hc_treated,
+  phase_keep = "late",
+  value_col = sum_imp_lag_over_blank,
+  title = "35-cycle: late persistent taxa",
+  xlab = "Summed attribution score\n(lag over blank)",
+  top_n = 15,
+  min_prev = 0.10,
+  min_n = 5
+)
+```
+
+```{r fig.height=5, fig.width=12}
+(p25_ext_over_blank_treated | p25_lag_over_blank_treated)
+```
+
+```{r fig.height=10, fig.width=12}
+p_taxa_ext_lag_treated_25_35 <-
+  (p25_ext_over_blank_treated + taxon_panel_theme |
+     p25_lag_over_blank_treated + taxon_panel_theme) /
+  (p35_ext_over_blank_treated + taxon_panel_theme |
+     p35_lag_over_blank_treated + taxon_panel_theme) +
+  patchwork::plot_annotation(
+    tag_levels = "A",
+    theme = theme(
+      plot.tag = element_text(size = 16, face = "bold"),
+      plot.tag.position = c(0, 1),
+      plot.margin = margin(5, 5, 5, 5)
+    )
+  )
+
+p_taxa_ext_lag_treated_25_35
+```

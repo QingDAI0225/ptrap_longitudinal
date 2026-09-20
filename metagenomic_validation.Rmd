@@ -1,0 +1,838 @@
+---
+title: "metagenomic_validation"
+output: html_document
+---
+
+```{r setup, message=FALSE, warning=FALSE}
+rm(list = ls())
+
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(tidyr)
+  library(stringr)
+  library(readr)
+  library(tibble)
+  library(ggplot2)
+  library(ggrepel)
+  library(patchwork)
+  library(purrr)
+})
+
+options(stringsAsFactors = FALSE)
+theme_set(theme_bw())
+```
+
+# user parameters
+
+```{r}
+code_dir <- normalizePath(getwd(), mustWork = TRUE)
+workspace_dir <- normalizePath(file.path(code_dir, ".."), mustWork = TRUE)
+data_dir <- path.expand(Sys.getenv(
+  "PTRAP_DATA_DIR",
+  unset = file.path("~", "projects", "p-trap_control", "HiFi_16S")
+))
+cache_dir <- path.expand(Sys.getenv(
+  "PTRAP_CACHE_DIR",
+  unset = file.path(workspace_dir, "cache")
+))
+output_root <- path.expand(Sys.getenv("PTRAP_OUTPUT_DIR", unset = code_dir))
+
+part1_cache_file <- file.path(cache_dir, "part1_pre_prediction_cache.rds")
+
+mg_table_file <- path.expand(Sys.getenv(
+  "PTRAP_METAGENOME_FILE",
+  unset = file.path(dirname(data_dir), "Mondays-S-Relative-Abundance-Counts.txt")
+))
+
+out_dir <- file.path(output_root, "metagenome_overlap_validation_pca")
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+
+use_16s_batch <- "25"
+tax_level     <- "genus"   # safest default here
+pseudo        <- 1e-6
+clr_pseudo_fallback <- 1e-8
+min_joint_mean_abund <- 1e-4
+min_mg_pca_mean_abund <- 1.25e-4
+mg_pca_pseudocount <- 1.5e-5
+assoc_top_n <- 20L
+restrict_ptraps <- c(1, 3)
+```
+
+# Helpers
+
+```{r}
+`%||%` <- function(x, y) if (is.null(x)) y else x
+stopf <- function(...) stop(sprintf(...), call. = FALSE)
+
+ptrap_labels <- c(
+  "1" = "handwashing p-trap 1",
+  "2" = "tap water p-trap",
+  "3" = "handwashing p-trap 2"
+)
+
+ptrap_colors <- c(
+  "1" = "#1b9e77",
+  "2" = "#7570b3",
+  "3" = "#d95f02"
+)
+
+extract_tax_rank <- function(x, rank_prefix = "g__") {
+  out <- sub(paste0(".*", rank_prefix, "([^;]+).*"), "\\1", x)
+  out[!grepl(rank_prefix, x, fixed = TRUE)] <- NA_character_
+  out <- str_squish(out)
+  out[out %in% c("", "NA", "uncultured", "unclassified", "metagenome")] <- NA_character_
+  out
+}
+
+make_16s_tax_label <- function(taxon_vec, tax_level = c("genus", "species")) {
+  tax_level <- match.arg(tax_level)
+
+  if (tax_level == "genus") {
+    out <- extract_tax_rank(taxon_vec, "g__")
+    out <- str_squish(out)
+    out[out %in% c("", "NA", "uncultured", "unclassified", "metagenome")] <- NA_character_
+    return(out)
+  }
+
+  genus   <- extract_tax_rank(taxon_vec, "g__")
+  species <- extract_tax_rank(taxon_vec, "s__")
+
+  genus   <- str_squish(genus)
+  species <- str_squish(species)
+  species[species %in% c("", "NA", "uncultured", "unclassified", "metagenome")] <- NA_character_
+
+  out <- ifelse(
+    !is.na(species) & !is.na(genus) &
+      str_detect(species, regex(paste0("^", stringr::fixed(genus), "\\s+"), ignore_case = FALSE)),
+    species,
+    ifelse(!is.na(species) & !is.na(genus), paste(genus, species), NA_character_)
+  )
+
+  out <- str_squish(out)
+  out <- sub("^([A-Za-z]+)\\s+\\1\\s+", "\\1 ", out)
+  out[!str_detect(out, regex("^[A-Z][A-Za-z0-9._-]+\\s+(sp\\.?|[a-z][A-Za-z0-9._-]+)$"))] <- NA_character_
+  out
+}
+
+make_mg_tax_label <- function(x, tax_level = c("genus", "species")) {
+  tax_level <- match.arg(tax_level)
+  x <- str_squish(as.character(x))
+  x[x %in% c("", "NA", "uncultured", "unclassified", "metagenome")] <- NA_character_
+
+  if (tax_level == "species") {
+    return(x)
+  }
+
+  out <- ifelse(
+    str_detect(x, "^Candidatus\\s+"),
+    str_replace(x, "^(Candidatus\\s+\\S+).*$", "\\1"),
+    word(x, 1)
+  )
+
+  out <- str_squish(out)
+  out[out %in% c("", "NA", "uncultured", "unclassified", "metagenome")] <- NA_character_
+  out
+}
+
+renormalize_ra <- function(df, sample_cols) {
+  mat <- as.matrix(df[, sample_cols, drop = FALSE])
+  storage.mode(mat) <- "numeric"
+  cs <- colSums(mat, na.rm = TRUE)
+  cs[cs == 0] <- NA_real_
+  mat <- sweep(mat, 2, cs, "/")
+  mat[is.na(mat)] <- 0
+  df[, sample_cols] <- mat
+  df
+}
+
+aggregate_ra_by_tax <- function(df, taxon_col, sample_cols) {
+  df %>%
+    filter(!is.na(.data[[taxon_col]]), .data[[taxon_col]] != "") %>%
+    group_by(.data[[taxon_col]]) %>%
+    summarise(across(all_of(sample_cols), ~ sum(as.numeric(.x), na.rm = TRUE)), .groups = "drop") %>%
+    rename(taxon_label = all_of(taxon_col))
+}
+
+ra_tbl_to_sample_tax_mat <- function(agg_tbl, sample_cols) {
+  tax_mat <- agg_tbl %>%
+    column_to_rownames("taxon_label") %>%
+    as.matrix()
+  tax_mat <- tax_mat[, sample_cols, drop = FALSE]
+  storage.mode(tax_mat) <- "numeric"
+  t(tax_mat)
+}
+
+compute_halfmin_pseudo <- function(x, fallback = 1e-8) {
+  pos <- as.numeric(x)
+  pos <- pos[is.finite(pos) & pos > 0]
+  if (length(pos) == 0) return(fallback)
+  min(pos) / 2
+}
+
+clr_transform <- function(sample_tax_mat, pseudo = NULL, fallback = 1e-8) {
+  x <- as.matrix(sample_tax_mat)
+  if (is.null(pseudo)) {
+    pseudo <- compute_halfmin_pseudo(x, fallback = fallback)
+  }
+  x <- x + pseudo
+  row_gm <- exp(rowMeans(log(x)))
+  out <- sweep(log(x), 1, log(row_gm), "-")
+  attr(out, "pseudocount") <- pseudo
+  out
+}
+
+month_lookup <- c(
+  Jan = "01", Feb = "02", Mar = "03", Apr = "04", May = "05", Jun = "06",
+  Jul = "07", Aug = "08", Sep = "09", Oct = "10", Nov = "11", Dec = "12"
+)
+
+parse_mg_sample_names <- function(sample_names, year = 2024L) {
+  pat <- "^(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)(\\d{2})_(\\d+)_([A-Za-z]+)$"
+  m <- str_match(sample_names, pat)
+
+  bad <- is.na(m[, 1])
+  if (any(bad)) {
+    stopf(
+      "These metagenomic sample names do not match the expected pattern 'Jun17_1_S': %s",
+      paste(sample_names[bad], collapse = ", ")
+    )
+  }
+
+  tibble(
+    mg_sample   = sample_names,
+    month_abbr  = m[, 2],
+    day         = m[, 3],
+    ptrap       = as.integer(m[, 4]),
+    mg_state    = m[, 5],
+    date        = as.Date(paste0(year, "-", month_lookup[m[, 2]], "-", m[, 3]))
+  )
+}
+
+sample_name_priority <- function(x) {
+  case_when(
+    str_detect(x, "_re2$") ~ -100,
+    !str_detect(x, "_(di|re)") ~ 50,
+    str_detect(x, "_di(\\.low)?$") ~ 40,
+    str_detect(x, "_re(\\.low)?$") ~ 30,
+    TRUE ~ 10
+  )
+}
+
+pick_one_16s_per_date_ptrap <- function(meta_tbl) {
+  meta_tbl %>%
+    mutate(
+      rest_priority = coalesce(as.numeric(resting_time), -Inf),
+      name_priority = sample_name_priority(Sample.Name),
+      order_priority = -coalesce(as.numeric(Sample.Order), 0)
+    ) %>%
+    arrange(date, ptrap, desc(rest_priority), desc(name_priority), desc(order_priority), Sample.Name) %>%
+    group_by(date, ptrap) %>%
+    slice(1) %>%
+    ungroup()
+}
+
+platform_mean_table <- function(sample_tax_16s, sample_tax_mg, pseudo = 1e-6) {
+  common_taxa <- intersect(colnames(sample_tax_16s), colnames(sample_tax_mg))
+  tibble(
+    taxon_label = common_taxa,
+    mean_16S = colMeans(sample_tax_16s[, common_taxa, drop = FALSE], na.rm = TRUE),
+    mean_MG  = colMeans(sample_tax_mg[, common_taxa, drop = FALSE], na.rm = TRUE)
+  ) %>%
+    mutate(
+      joint_mean = (mean_16S + mean_MG) / 2,
+      log10_mean_16S = log10(mean_16S + pseudo),
+      log10_mean_MG  = log10(mean_MG + pseudo)
+    )
+}
+
+safe_spearman <- function(x, y) {
+  suppressWarnings(cor(x, y, method = "spearman", use = "pairwise.complete.obs"))
+}
+
+safe_pearson <- function(x, y) {
+  suppressWarnings(cor(x, y, method = "pearson", use = "pairwise.complete.obs"))
+}
+
+safe_cor_test_p <- function(x, y, method = "spearman") {
+  out <- tryCatch(
+    suppressWarnings(cor.test(x, y, method = method, exact = FALSE)$p.value),
+    error = function(e) NA_real_
+  )
+  out
+}
+
+orient_pca_pc1_to_time <- function(pca_obj, sample_meta) {
+  scores <- as.data.frame(pca_obj$x[, 1:2, drop = FALSE]) %>%
+    rownames_to_column("mg_sample") %>%
+    left_join(sample_meta, by = "mg_sample")
+
+  rho <- safe_spearman(scores$PC1, scores$day_num)
+  sgn <- ifelse(is.na(rho) || rho >= 0, 1, -1)
+
+  pca_obj$x[, 1] <- pca_obj$x[, 1] * sgn
+  pca_obj$rotation[, 1] <- pca_obj$rotation[, 1] * sgn
+
+  list(
+    pca = pca_obj,
+    sign_pc1 = sgn
+  )
+}
+
+as_cached_score_df <- function(obj) {
+  if (is.null(obj)) return(NULL)
+
+  if (inherits(obj, "prcomp")) {
+    if (is.null(obj$x)) return(NULL)
+    df <- as.data.frame(obj$x[, 1:2, drop = FALSE])
+    if (!is.null(rownames(df)) && any(nzchar(rownames(df)))) {
+      df$Sample.Name <- rownames(df)
+    }
+  } else if (is.data.frame(obj) || is.matrix(obj)) {
+    df <- as.data.frame(obj)
+    sample_col <- intersect(c("Sample.Name", "sample", "sample_name", "Sample", "id"), names(df))
+    if (length(sample_col) > 0) {
+      df$Sample.Name <- as.character(df[[sample_col[1]]])
+    } else if (!is.null(rownames(df)) && any(nzchar(rownames(df)))) {
+      df$Sample.Name <- rownames(df)
+    } else {
+      return(NULL)
+    }
+  } else {
+    return(NULL)
+  }
+
+  pc1_col <- intersect(c("PC1", "Axis1", "axis1", "Dim1"), names(df))
+  pc2_col <- intersect(c("PC2", "Axis2", "axis2", "Dim2"), names(df))
+
+  if (length(pc1_col) == 0 || length(pc2_col) == 0) {
+    num_cols <- names(df)[vapply(df, is.numeric, logical(1))]
+    num_cols <- setdiff(num_cols, c("ptrap", "resting_time", "week", "day_num"))
+    if (length(num_cols) < 2) return(NULL)
+    pc1_col <- num_cols[1]
+    pc2_col <- num_cols[2]
+  } else {
+    pc1_col <- pc1_col[1]
+    pc2_col <- pc2_col[1]
+  }
+
+  tibble(
+    Sample.Name = as.character(df$Sample.Name),
+    PC1 = as.numeric(df[[pc1_col]]),
+    PC2 = as.numeric(df[[pc2_col]])
+  ) %>%
+    filter(!is.na(Sample.Name))
+}
+
+get_cached_16s_scores <- function(cache, use_16s_batch = "25") {
+  candidates <- switch(
+    use_16s_batch,
+    "25" = list(cache$scores_25_ptrap),
+    "35_all" = list(cache$scores_35_all),
+    "35_hc" = list(cache$scores_35_hc),
+    list()
+  )
+
+  for (obj in candidates) {
+    out <- tryCatch(as_cached_score_df(obj), error = function(e) NULL)
+    if (!is.null(out) && nrow(out) > 0) return(out)
+  }
+  NULL
+}
+
+compute_axis_summary <- function(scores_df, platform_name) {
+  rho_pc1_day <- safe_spearman(scores_df$PC1, scores_df$day_num)
+  p_pc1_day   <- safe_cor_test_p(scores_df$PC1, scores_df$day_num, method = "spearman")
+  pear_pc1_day <- safe_pearson(scores_df$PC1, scores_df$day_num)
+
+  if (length(unique(scores_df$ptrap)) == 2) {
+    p_pc2_ptrap <- tryCatch(wilcox.test(PC2 ~ factor(ptrap), data = scores_df)$p.value, error = function(e) NA_real_)
+    delta_pc2 <- scores_df %>%
+      group_by(ptrap) %>%
+      summarise(m = mean(PC2, na.rm = TRUE), .groups = "drop") %>%
+      arrange(ptrap)
+    delta_pc2 <- if (nrow(delta_pc2) == 2) diff(delta_pc2$m) else NA_real_
+  } else {
+    p_pc2_ptrap <- tryCatch(kruskal.test(PC2 ~ factor(ptrap), data = scores_df)$p.value, error = function(e) NA_real_)
+    delta_pc2 <- NA_real_
+  }
+
+  tibble(
+    platform = platform_name,
+    n_samples = nrow(scores_df),
+    pc1_day_spearman = rho_pc1_day,
+    pc1_day_spearman_p = p_pc1_day,
+    pc1_day_pearson = pear_pc1_day,
+    pc2_ptrap_p = p_pc2_ptrap,
+    pc2_ptrap_mean_diff_high_minus_low = delta_pc2
+  )
+}
+
+compute_taxon_axis_association <- function(clr_mat, sample_tax_mat, scores_df, platform_name, pseudo = 1e-6) {
+  taxa <- colnames(clr_mat)
+
+  tibble(
+    taxon_label = taxa,
+    platform = platform_name,
+    mean_abundance = colMeans(sample_tax_mat[, taxa, drop = FALSE], na.rm = TRUE),
+    prevalence = colMeans(sample_tax_mat[, taxa, drop = FALSE] > 0, na.rm = TRUE),
+    cor_with_pc1 = map_dbl(taxa, ~ safe_spearman(clr_mat[, .x], scores_df$PC1)),
+    p_with_pc1 = map_dbl(taxa, ~ safe_cor_test_p(clr_mat[, .x], scores_df$PC1, method = "spearman")),
+    cor_with_day = map_dbl(taxa, ~ safe_spearman(clr_mat[, .x], scores_df$day_num)),
+    p_with_day = map_dbl(taxa, ~ safe_cor_test_p(clr_mat[, .x], scores_df$day_num, method = "spearman"))
+  ) %>%
+    mutate(
+      abs_cor_with_pc1 = abs(cor_with_pc1),
+      abs_cor_with_day = abs(cor_with_day),
+      log10_mean_abundance = log10(mean_abundance + pseudo)
+    )
+}
+
+```
+
+# Load cache and metagenomic table
+
+```{r}
+if (!file.exists(part1_cache_file)) {
+  stopf("part1 cache not found: %s", part1_cache_file)
+}
+if (!file.exists(mg_table_file)) {
+  stopf("metagenomic taxonomy table not found: %s", mg_table_file)
+}
+
+cache <- readRDS(part1_cache_file)
+
+required_cache_names <- c(
+  "id_cols", "meta_25_ptrap", "ra_25_ptrap",
+  "meta_35_ptrap", "ra_35_ptrap",
+  "meta_35_ptrap_hc", "ra_35_ptrap_hc"
+)
+missing_cache <- setdiff(required_cache_names, names(cache))
+if (length(missing_cache) > 0) {
+  message("Part1 cache is missing some optional names: ", paste(missing_cache, collapse = ", "))
+}
+
+id_cols <- cache$id_cols %||% c("Sequence", "Taxon", "id", "Consensus")
+
+if (use_16s_batch == "25") {
+  meta_16s <- cache$meta_25_ptrap
+  ra_16s   <- cache$ra_25_ptrap
+} else if (use_16s_batch == "35_all") {
+  meta_16s <- cache$meta_35_ptrap
+  ra_16s   <- cache$ra_35_ptrap
+} else if (use_16s_batch == "35_hc") {
+  meta_16s <- cache$meta_35_ptrap_hc
+  ra_16s   <- cache$ra_35_ptrap_hc
+} else {
+  stopf("Unknown use_16s_batch: %s", use_16s_batch)
+}
+
+if (is.null(meta_16s) || is.null(ra_16s)) {
+  stopf("Failed to load the requested 16S objects from the cache for batch '%s'.", use_16s_batch)
+}
+
+mg_raw <- read.delim(mg_table_file, sep = "\t", check.names = FALSE, stringsAsFactors = FALSE)
+if (ncol(mg_raw) < 2) {
+  stopf("Metagenomic table has fewer than 2 columns: %s", mg_table_file)
+}
+
+mg_tax_col     <- names(mg_raw)[1]
+mg_sample_cols <- setdiff(names(mg_raw), mg_tax_col)
+
+mg_raw[mg_sample_cols] <- lapply(mg_raw[mg_sample_cols], as.numeric)
+mg_meta <- parse_mg_sample_names(mg_sample_cols, year = 2024L)
+
+if (!is.null(restrict_ptraps)) {
+  mg_meta <- mg_meta %>% filter(ptrap %in% restrict_ptraps)
+}
+mg_sample_cols <- mg_meta$mg_sample
+```
+
+# Build date/ptrap sample map
+
+```{r}
+meta_16s_sub <- meta_16s %>%
+  mutate(date = as.Date(date)) %>%
+  filter(ptrap %in% unique(mg_meta$ptrap), date %in% unique(mg_meta$date))
+
+picked_16s <- pick_one_16s_per_date_ptrap(meta_16s_sub)
+
+mg_meta$ptrap = as.factor(mg_meta$ptrap)
+
+sample_map <- mg_meta %>%
+  left_join(
+    picked_16s %>%
+      select(date, ptrap, Sample.Name, Phenotype, resting_time, week, dow),
+    by = c("date", "ptrap")
+  ) %>%
+  arrange(date, ptrap)
+
+if (any(is.na(sample_map$Sample.Name))) {
+  warning(
+    "Some metagenomic samples could not be matched to a 16S sample by date + ptrap.\n",
+    "Unmatched rows:\n",
+    paste(capture.output(print(sample_map %>% filter(is.na(Sample.Name)))), collapse = "\n")
+  )
+}
+
+sample_map_use <- sample_map %>%
+  filter(!is.na(Sample.Name)) %>%
+  mutate(day_num = as.numeric(date - min(date, na.rm = TRUE)))
+
+if (nrow(sample_map_use) < 4) {
+  stopf("Too few matched overlap samples after date/ptrap matching: n = %d", nrow(sample_map_use))
+}
+```
+
+# Prepare 16S table
+
+```{r}
+keep_16s_samples <- unique(sample_map_use$Sample.Name)
+keep_mg_samples  <- unique(sample_map_use$mg_sample)
+
+sample_map_use2 <- sample_map_use %>%
+  distinct(mg_sample, Sample.Name, .keep_all = TRUE)
+
+ra_16s_use <- ra_16s %>%
+  select(any_of(c(id_cols, keep_16s_samples)))
+
+if (!"Taxon" %in% names(ra_16s_use)) {
+  stopf("The 16S abundance table does not contain a 'Taxon' column.")
+}
+
+ra_16s_use <- ra_16s_use %>%
+  mutate(taxon_label = make_16s_tax_label(Taxon, tax_level = tax_level))
+
+ra_16s_agg <- aggregate_ra_by_tax(
+  df = ra_16s_use,
+  taxon_col = "taxon_label",
+  sample_cols = keep_16s_samples
+)
+
+rename_to_mg <- setNames(sample_map_use2$Sample.Name, sample_map_use2$mg_sample)
+ra_16s_agg <- ra_16s_agg %>% rename(all_of(rename_to_mg))
+ra_16s_agg <- ra_16s_agg %>% select(taxon_label, all_of(sample_map_use2$mg_sample))
+ra_16s_agg <- renormalize_ra(ra_16s_agg, sample_map_use2$mg_sample)
+```
+
+# Prepare metagenomic table
+
+```{r}
+mg_use <- mg_raw %>%
+  rename(raw_taxon = all_of(mg_tax_col)) %>%
+  select(raw_taxon, all_of(keep_mg_samples)) %>%
+  mutate(taxon_label = make_mg_tax_label(raw_taxon, tax_level = tax_level))
+
+mg_agg <- aggregate_ra_by_tax(
+  df = mg_use,
+  taxon_col = "taxon_label",
+  sample_cols = keep_mg_samples
+)
+mg_agg <- renormalize_ra(mg_agg, keep_mg_samples)
+```
+
+# Intersect taxa and build sample x taxon matrices
+
+```{r}
+common_taxa <- intersect(ra_16s_agg$taxon_label, mg_agg$taxon_label)
+if (length(common_taxa) < 10) {
+  stopf(
+    "Only %d common taxa were found between 16S and metagenomic tables at tax_level = '%s'. Try tax_level = 'genus'.",
+    length(common_taxa), tax_level
+  )
+}
+
+ra_16s_common <- ra_16s_agg %>% filter(taxon_label %in% common_taxa)
+mg_common     <- mg_agg     %>% filter(taxon_label %in% common_taxa)
+
+sample_order <- sample_map_use2 %>%
+  distinct(mg_sample, date, ptrap, day_num) %>%
+  arrange(date, ptrap) %>%
+  pull(mg_sample)
+
+# Platform-specific matrices used for PCA and genus-level associations.
+sample_tax_16s_pca <- ra_tbl_to_sample_tax_mat(ra_16s_agg, sample_order)
+sample_tax_mg_pca  <- ra_tbl_to_sample_tax_mat(mg_agg,      sample_order)
+sample_tax_mg_pca <- sample_tax_mg_pca[
+  , colMeans(sample_tax_mg_pca, na.rm = TRUE) >= min_mg_pca_mean_abund,
+  drop = FALSE
+]
+
+# Cross-platform taxon summaries use the shared genus subcomposition.
+sample_tax_16s <- ra_tbl_to_sample_tax_mat(ra_16s_common, sample_order)
+sample_tax_mg  <- ra_tbl_to_sample_tax_mat(mg_common,     sample_order)
+
+joint_means <- platform_mean_table(sample_tax_16s, sample_tax_mg, pseudo = pseudo) %>%
+  arrange(desc(joint_mean))
+
+keep_taxa <- joint_means %>%
+  filter(joint_mean >= min_joint_mean_abund) %>%
+  pull(taxon_label)
+
+if (length(keep_taxa) < 10) {
+  keep_taxa <- head(joint_means$taxon_label, 25)
+}
+
+sample_tax_16s <- sample_tax_16s[, keep_taxa, drop = FALSE]
+sample_tax_mg  <- sample_tax_mg[, keep_taxa, drop = FALSE]
+```
+
+# Cross-platform consistency summaries
+
+```{r}
+mean_tbl <- platform_mean_table(sample_tax_16s, sample_tax_mg, pseudo = pseudo) %>%
+  arrange(desc(joint_mean))
+
+write.csv(mean_tbl, file.path(out_dir, "top_taxa_summary.csv"), row.names = FALSE)
+
+spearman_taxa <- suppressWarnings(cor(mean_tbl$mean_16S, mean_tbl$mean_MG, method = "spearman"))
+pearson_taxa  <- suppressWarnings(cor(log10(mean_tbl$mean_16S + pseudo), log10(mean_tbl$mean_MG + pseudo), method = "pearson"))
+
+```
+
+
+# PCA time-axis
+
+```{r}
+clr_16s_platform <- clr_transform(sample_tax_16s_pca, pseudo = NULL, fallback = clr_pseudo_fallback)
+clr_mg_pca  <- clr_transform(sample_tax_mg_pca, pseudo = mg_pca_pseudocount, fallback = clr_pseudo_fallback)
+clr_16s_platform_pseudo <- attr(clr_16s_platform, "pseudocount")
+clr_mg_pca_pseudo  <- attr(clr_mg_pca, "pseudocount")
+
+sample_meta_ordered <- sample_map_use2 %>%
+  distinct(mg_sample, Sample.Name, date, ptrap, mg_state, day_num) %>%
+  arrange(match(mg_sample, sample_order))
+
+cached_scores_16s_all <- get_cached_16s_scores(cache, use_16s_batch)
+if (is.null(cached_scores_16s_all)) {
+  stop("Cached 16S PCA scores were not found.")
+}
+used_cached_16s_pca <- TRUE
+
+scores_16s <- sample_meta_ordered %>%
+  left_join(cached_scores_16s_all, by = "Sample.Name")
+if (any(is.na(scores_16s$PC1)) || any(is.na(scores_16s$PC2))) {
+  stop("Cached 16S PCA scores were found, but some overlap samples could not be matched by Sample.Name.")
+}
+rho_16s_pc1_day <- safe_spearman(scores_16s$PC1, scores_16s$day_num)
+sgn_16s <- ifelse(is.na(rho_16s_pc1_day) || rho_16s_pc1_day >= 0, 1, -1)
+scores_16s <- scores_16s %>%
+  mutate(PC1 = PC1 * sgn_16s, platform = "16S")
+
+pca_mg_raw  <- prcomp(clr_mg_pca, center = TRUE, scale. = FALSE)
+pca_mg_oriented  <- orient_pca_pc1_to_time(pca_mg_raw,  sample_meta_ordered %>% select(-Sample.Name))
+pca_mg  <- pca_mg_oriented$pca
+
+scores_mg <- as.data.frame(pca_mg$x[, 1:2, drop = FALSE]) %>%
+  rownames_to_column("mg_sample") %>%
+  left_join(sample_meta_ordered, by = "mg_sample") %>%
+  mutate(platform = "Metagenome")
+
+axis_summary_16s <- compute_axis_summary(scores_16s, "16S")
+axis_summary_mg  <- compute_axis_summary(scores_mg,  "Metagenome")
+axis_summary_tbl <- bind_rows(axis_summary_16s, axis_summary_mg)
+write.csv(axis_summary_tbl, file.path(out_dir, "pca_axis_summary.csv"), row.names = FALSE)
+
+p_pc1_day_16s <- ggplot(scores_16s, aes(x = date, y = PC1, color = factor(ptrap))) +
+  geom_point(size = 3) +
+  geom_smooth(method = "lm", se = FALSE, linewidth = 0.8) +
+  geom_text_repel(aes(label = format(date, "%b%d")), size = 3, max.overlaps = 100) +
+  scale_color_manual(values = ptrap_colors, labels = ptrap_labels, drop = FALSE) +
+  scale_x_date(date_labels = "%b %d") +
+  labs(title = "16S amplicon PC1 vs time", x = "Date", y = "Overlap-only PC1 score", color = "p-trap")
+
+p_pc1_day_mg <- ggplot(scores_mg, aes(x = date, y = PC1, color = factor(ptrap))) +
+  geom_point(size = 3) +
+  geom_smooth(method = "lm", se = FALSE, linewidth = 0.8) +
+  geom_text_repel(aes(label = format(date, "%b%d")), size = 3, max.overlaps = 100) +
+  scale_color_manual(values = ptrap_colors, labels = ptrap_labels, drop = FALSE) +
+  scale_x_date(date_labels = "%b %d") +
+  labs(title = "Metagenome PC1 vs time", x = "Date", y = "Overlap-only PC1 score", color = "p-trap")
+
+```
+
+```{r fig.width=12, fig.height=4.4}
+pca_ptrap_scale <- scale_color_manual(
+    name = "p-trap",
+    breaks = c("1", "3"),
+    values = c(
+      "1" = "#1b9e77",
+      "3" = "#d95f02"
+    ),
+    labels = c(
+      "1" = "handwashing replicate 1",
+      "3" = "handwashing replicate 2"
+    )
+  )
+
+(p_pc1_day_16s + pca_ptrap_scale +
+   guides(color = guide_legend(ncol = 1, byrow = TRUE)) +
+   theme(legend.position = "right", legend.direction = "vertical") |
+   p_pc1_day_mg + pca_ptrap_scale +
+   guides(color = guide_legend(ncol = 1, byrow = TRUE)) +
+   theme(legend.position = "right", legend.direction = "vertical")) +
+  plot_layout(guides = "collect") +
+  plot_annotation(tag_levels = "A")
+```
+
+
+
+```{r}
+assoc_16s <- compute_taxon_axis_association(
+  clr_mat = clr_16s_platform,
+  sample_tax_mat = sample_tax_16s_pca,
+  scores_df = scores_16s,
+  platform_name = "16S",
+  pseudo = pseudo
+)
+
+assoc_mg <- compute_taxon_axis_association(
+  clr_mat = clr_mg_pca,
+  sample_tax_mat = sample_tax_mg_pca,
+  scores_df = scores_mg,
+  platform_name = "Metagenome",
+  pseudo = pseudo
+)
+
+assoc_tbl <- bind_rows(assoc_16s, assoc_mg)
+write.csv(assoc_tbl, file.path(out_dir, "taxon_time_axis_association_long.csv"), row.names = FALSE)
+
+assoc_compare <- assoc_16s %>%
+  select(
+    taxon_label,
+    mean_abundance_16s = mean_abundance,
+    prevalence_16s = prevalence,
+    cor_with_pc1_16s = cor_with_pc1,
+    p_with_pc1_16s = p_with_pc1,
+    cor_with_day_16s = cor_with_day,
+    p_with_day_16s = p_with_day
+  ) %>%
+  inner_join(
+    assoc_mg %>%
+      select(
+        taxon_label,
+        mean_abundance_mg = mean_abundance,
+        prevalence_mg = prevalence,
+        cor_with_pc1_mg = cor_with_pc1,
+        p_with_pc1_mg = p_with_pc1,
+        cor_with_day_mg = cor_with_day,
+        p_with_day_mg = p_with_day
+      ),
+    by = "taxon_label"
+  ) %>%
+  dplyr::filter(taxon_label %in% keep_taxa) %>%
+  mutate(
+    avg_abs_pc1_assoc = (abs(cor_with_pc1_16s) + abs(cor_with_pc1_mg)) / 2,
+    avg_abs_day_assoc = (abs(cor_with_day_16s) + abs(cor_with_day_mg)) / 2,
+    sign_concordant_pc1 = sign(cor_with_pc1_16s) == sign(cor_with_pc1_mg),
+    sign_concordant_day = sign(cor_with_day_16s) == sign(cor_with_day_mg)
+  ) %>%
+  left_join(mean_tbl %>% select(taxon_label, joint_mean), by = "taxon_label") %>%
+  arrange(desc(avg_abs_pc1_assoc), desc(joint_mean))
+
+# Keep up to 20 abundant genera detected in both platforms.
+assoc_compare_detected <- assoc_compare %>%
+  filter(
+    mean_abundance_16s > 0,
+    mean_abundance_mg > 0
+  ) %>%
+  arrange(desc(joint_mean)) %>%
+  slice_head(n = assoc_top_n)
+
+pc1_assoc_spearman <- safe_spearman(assoc_compare_detected$cor_with_pc1_16s, assoc_compare_detected$cor_with_pc1_mg)
+pc1_assoc_pearson  <- safe_pearson(assoc_compare_detected$cor_with_pc1_16s, assoc_compare_detected$cor_with_pc1_mg)
+day_assoc_spearman <- safe_spearman(assoc_compare_detected$cor_with_day_16s, assoc_compare_detected$cor_with_day_mg)
+
+assoc_summary_tbl <- tibble(
+  use_16s_batch = use_16s_batch,
+  tax_level = tax_level,
+  used_cached_16s_pca = used_cached_16s_pca,
+  clr_pseudocount_16s = clr_16s_platform_pseudo,
+  clr_pseudocount_mg = clr_mg_pca_pseudo,
+  n_matched_samples = nrow(sample_map_use2),
+  n_common_taxa_after_filter = ncol(sample_tax_16s),
+  n_taxa_for_cross_platform_association = nrow(assoc_compare_detected),
+  assoc_top_n = assoc_top_n,
+  association_requires_nonzero_both = TRUE,
+  spearman_taxon_mean = unname(spearman_taxa),
+  pearson_log10_taxon_mean = unname(pearson_taxa),
+  pc1_day_spearman_16s = axis_summary_16s$pc1_day_spearman,
+  pc1_day_p_16s = axis_summary_16s$pc1_day_spearman_p,
+  pc1_day_spearman_mg = axis_summary_mg$pc1_day_spearman,
+  pc1_day_p_mg = axis_summary_mg$pc1_day_spearman_p,
+  pc1_assoc_spearman = pc1_assoc_spearman,
+  pc1_assoc_pearson = pc1_assoc_pearson,
+  day_assoc_spearman = day_assoc_spearman,
+  frac_sign_concordant_pc1 = mean(assoc_compare_detected$sign_concordant_pc1, na.rm = TRUE),
+  frac_sign_concordant_day = mean(assoc_compare_detected$sign_concordant_day, na.rm = TRUE)
+)
+
+assoc_summary_tbl
+```
+
+```{r}
+label_assoc_taxa <- assoc_compare_detected
+
+p_assoc_scatter <- ggplot(assoc_compare_detected, aes(x = cor_with_pc1_16s, y = cor_with_pc1_mg)) +
+  geom_hline(yintercept = 0, linetype = 2, color = "grey60") +
+  geom_vline(xintercept = 0, linetype = 2, color = "grey60") +
+  geom_point(aes(size = joint_mean, alpha = avg_abs_pc1_assoc)) +
+  geom_text_repel(
+    data = label_assoc_taxa,
+    aes(label = taxon_label),
+    size = 3,
+    max.overlaps = 30
+  ) +
+  scale_alpha_continuous(range = c(0.45, 0.95), guide = "none") +
+  labs(
+    x = "Genus CLR correlation with PC1 in 16S",
+    y = "Genus CLR correlation with PC1 in metagenome",
+    size = "Joint mean abundance"
+  )
+```
+
+```{r fig.width=9, fig.height=7}
+p_assoc_scatter
+```
+
+
+# Save bundle
+
+```{r}
+validation_bundle <- list(
+  params = list(
+    use_16s_batch = use_16s_batch,
+    tax_level = tax_level,
+    pseudo = pseudo,
+    clr_pseudocount_16s_platform = clr_16s_platform_pseudo,
+    clr_pseudocount_mg_pca = clr_mg_pca_pseudo,
+    restrict_ptraps = restrict_ptraps,
+    min_joint_mean_abund = min_joint_mean_abund,
+    min_mg_pca_mean_abund = min_mg_pca_mean_abund,
+    mg_pca_pseudocount = mg_pca_pseudocount,
+    assoc_top_n = assoc_top_n
+  ),
+  sample_map = sample_map,
+  sample_map_use = sample_map_use2,
+  mean_tbl = mean_tbl,
+  axis_summary_tbl = axis_summary_tbl,
+  assoc_summary_tbl = assoc_summary_tbl,
+  assoc_compare = assoc_compare,
+  assoc_compare_detected = assoc_compare_detected,
+  sample_tax_16s = sample_tax_16s,
+  sample_tax_mg = sample_tax_mg,
+  sample_tax_16s_pca = sample_tax_16s_pca,
+  sample_tax_mg_pca = sample_tax_mg_pca,
+  clr_16s_platform = clr_16s_platform,
+  clr_mg_pca = clr_mg_pca,
+  pca_mg = pca_mg,
+  scores_16s = scores_16s,
+  scores_mg = scores_mg,
+  assoc_16s = assoc_16s,
+  assoc_mg = assoc_mg
+)
+
+saveRDS(validation_bundle, file.path(out_dir, "overlap_validation_bundle_pca.rds"), compress = "xz")
+
+message("Done. Outputs written to: ", out_dir)
+print(assoc_summary_tbl)
+```

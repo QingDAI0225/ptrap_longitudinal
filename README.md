@@ -59,5 +59,3 @@ Rscript -e 'rmarkdown::render("03-data_visualization.Rmd")'
 Rscript -e 'rmarkdown::render("final_day_recovery_analysis.Rmd")'
 Rscript -e 'rmarkdown::render("metagenomic_validation.Rmd")'
 ```
-
-Generated HTML reports, caches, tables, and figures are intentionally excluded from version control.

@@ -1,3 +1,5 @@
+[![DOI](https://zenodo.org/badge/1378424523.svg)](https://doi.org/10.5281/zenodo.22859443)
+
 # P-trap longitudinal microbiome analysis
 
 This repository contains the finalized R analysis workflow associated with the article available at [https://doi.org/10.64898/2026.05.13.724980](https://doi.org/10.64898/2026.05.13.724980), covering longitudinal analysis of full-length 16S sequencing data from p-trap samples, source-support modeling, final-day recovery analysis, and metagenomic validation.
